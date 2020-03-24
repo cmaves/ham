@@ -1,6 +1,6 @@
 
 
-use gpio_cdev::{Chip,Line,LineHandle,LineRequestFlags};
+use gpio_cdev::{Line,LineHandle,LineRequestFlags};
 use spidev::{Spidev,SpidevTransfer,SpidevOptions,SpiModeFlags};
 use crate::Error;
 use std::convert::TryInto;
@@ -82,6 +82,10 @@ impl Rfm69 {
 		self.spi.transfer_multiple(&mut xfers)
 		
 	}
+	fn write(&self, reg: Register, val: u8) -> Result<(), std::io::Error> {
+		let buf = [val];
+		self.write_many(reg, &buf)
+	}
 	fn write_many(&self, reg: Register, buf: &[u8]) -> Result<(), std::io::Error> {
 		let reg = [(reg as u8) | 0x80];
 		let mut addr_xfer = SpidevTransfer::write(&reg);
@@ -153,11 +157,23 @@ impl Rfm69 {
 			Ok(())
 		}
 	}
-	pub fn sync(&self) -> Result<SyncConfig, Error> {
+	pub fn sync(&self) -> Result<SyncConfig, std::io::Error> {
 		let mut buf = [0; 9];
 		self.read_many(Register::SyncConfig, &mut buf)?;
 		Ok(SyncConfig::from(&buf))
 		
+	}
+	pub fn temp(&self) -> Result<i8, Error> {
+		self.write(Register::Temp1, 0x08)?;
+		for _ in 0..5 {
+			sleep(Duration::from_micros(20));
+			let mut buf = [0, 0];
+			self.read_many(Register::Temp1, &mut buf)?;
+			if buf[0] & 0x04 == 0 {
+				return Ok(buf[1] as i8);
+			}
+		}
+		Err(Error::Timeout("Temperature reading timed out!".to_string()))
 	}
 }
 impl Drop for Rfm69 {
