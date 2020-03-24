@@ -16,7 +16,8 @@ pub struct Rfm69 {
 	_g2: Option<LineHandle>,
 	_g3: Option<LineHandle>,
 	_g4: Option<LineHandle>,
-	_g5: Option<LineHandle>
+	_g5: Option<LineHandle>,
+	verbose: bool
 }
 
 const FXOSC: u32 = 32_000_000;
@@ -45,7 +46,7 @@ impl Rfm69 {
 
 		spi.configure(&options)?;
 
-		let rfm = Rfm69 { spi, rst, en , g0, _g1: None, _g2: None, _g3: None, _g4: None, _g5: None };
+		let rfm = Rfm69 { spi, rst, en , g0, _g1: None, _g2: None, _g3: None, _g4: None, _g5: None, verbose: false };
 		rfm.validate_dev()?;
 		Ok(rfm)
 	}
@@ -159,6 +160,20 @@ impl Rfm69 {
 		
 	}
 }
+impl Drop for Rfm69 {
+	fn drop(&mut self) {
+		if let Err(e) = self.en.set_value(0) {
+			if self.verbose {
+				eprintln!("Failed to set enable pin to off on drop: {:?}", e);
+			}
+		}
+		if let Err(e) = self.rst.set_value(1) {
+			if self.verbose {
+				eprintln!("Failed to reset on drop to off on drop: {:?}", e);
+			}
+		}
+	}
+}
 
 pub enum Register {
     Fifo = 0x00,
@@ -262,7 +277,7 @@ impl From<&[u8; 9]> for SyncConfig {
 		ret.len = (bytes[0] & 0x38) >> 3;
 		ret.diff = bytes[0] & 0x07;
 		for (i, v) in bytes[1..9].iter().enumerate() {
-			ret.syncword[i + 1] = *v;	
+			ret.syncword[i] = *v;	
 		}
 		ret
 	}
