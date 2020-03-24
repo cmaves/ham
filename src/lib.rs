@@ -6,7 +6,8 @@ pub mod rfm69;
 pub enum Error {
 	GpioError(gpio_cdev::errors::Error),
 	InitError(String),
-	IoError(std::io::Error)
+	IoError(std::io::Error),
+	BadInputs(String)
 }
 impl From<gpio_cdev::errors::Error> for Error {
 	fn from(v: gpio_cdev::errors::Error) -> Self {

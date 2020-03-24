@@ -3,6 +3,7 @@
 use gpio_cdev::{Chip,Line,LineHandle,LineRequestFlags};
 use spidev::{Spidev,SpidevTransfer,SpidevOptions,SpiModeFlags};
 use crate::Error;
+use std::convert::TryInto;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -17,6 +18,11 @@ pub struct Rfm69 {
 	_g4: Option<LineHandle>,
 	_g5: Option<LineHandle>
 }
+
+const FXOSC: u32 = 32_000_000;
+const FSTEP: f64 = (FXOSC as f64) / 524_288.0; // FOSC/2^19
+const MIN_FREQ: u32 = 290_000_000;
+const MAX_FREQ: u32 = 1020_000_000;
 
 impl Rfm69 {
 	pub fn new(rst: Line, en: Line, g0: Line, mut spi: Spidev) -> Result<Self, Error> {
@@ -90,6 +96,42 @@ impl Rfm69 {
 	pub fn read_all(&self) -> Result<[u8; 0x4E],std::io::Error> {
 		let mut ret = [0; 0x4E];	
 		self.read_many(Register::OpMode, &mut ret)?;
+		Ok(ret)
+	}
+	pub fn set_bitrate(&self, bitrate: u32) -> Result<(), Error> {
+		if let Ok(v) = ((FXOSC as f64 / bitrate as f64).round() as u64).try_into() {
+			let v: u16 = v;
+			self.write_many(Register::BitrateMsb, &v.to_be_bytes())?;
+			Ok(())
+		} else {
+			Err(Error::BadInputs("Bitrate out of bounds!".to_string()))
+		}
+	}
+	pub fn bitrate(&self) -> Result<u32, Error> {
+		let mut v = [0, 0];	
+		self.read_many(Register::BitrateMsb, &mut v)?;
+		let v = u16::from_be_bytes(v);
+		let v = (FXOSC as f64 / v as f64).round() as u32;
+		Ok(v)
+	}
+	pub fn set_frequency(&self, frequency: u32) -> Result<(), Error> {
+		if frequency < MIN_FREQ {
+			Err(Error::BadInputs(format!("Frequency must be at least {} Mhz! Depending on the specific radio module the actually minimum frequency may be higher.", MIN_FREQ / 1_000_000)))
+		} else if frequency > MAX_FREQ {
+			Err(Error::BadInputs(format!("Frequency must be less than or equal to {} Mhz! Depending on the specific radio module the actually maximum frequency may be lower.", MAX_FREQ / 1_000_000)))
+		} else {
+			let v =  ((frequency as f64) / FSTEP ).round() as u32;
+			let v = v.to_be_bytes();
+			self.write_many(Register::FrfMsb, &v[1..4])?;
+			Ok(())
+		}
+		
+	}
+	pub fn frequency(&self) -> Result<u32, Error> {
+		let mut v = [0; 4];	
+		self.read_many(Register::FrfMsb, &mut v[1..4])?;
+		let v = u32::from_be_bytes(v);
+		let ret = (v as f64 * FSTEP).round() as u32;
 		Ok(ret)
 	}
 }
