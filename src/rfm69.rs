@@ -134,6 +134,30 @@ impl Rfm69 {
 		let ret = (v as f64 * FSTEP).round() as u32;
 		Ok(ret)
 	}
+	pub fn set_sync(&self, config: &SyncConfig) -> Result<(), Error> {
+		if config.len > 8 {
+			Err(Error::BadInputs("The syncword length must be [0,8]".to_string()))
+		} else if config.diff > 7 {
+			Err(Error::BadInputs("The allowed bit diff must be length must be [0,7]".to_string()))
+		} else {
+			let mut v = [0; 9];
+			v[0] = 0x80 * config.on as u8;
+			v[0] |= 0x40 * config.condition as u8;
+			v[0] |= (config.len - 1) << 3;
+			v[0] |= config.diff;
+			for (i, n) in config.syncword.iter().enumerate() {
+				v[i + 1] = *n;	
+			}
+			self.write_many(Register::SyncConfig, &v)?;
+			Ok(())
+		}
+	}
+	pub fn sync(&self) -> Result<SyncConfig, Error> {
+		let mut buf = [0; 9];
+		self.read_many(Register::SyncConfig, &mut buf)?;
+		Ok(SyncConfig::from(&buf))
+		
+	}
 }
 
 pub enum Register {
@@ -223,3 +247,36 @@ pub enum Register {
     TestDagc = 0x6F,
 }
 
+pub struct SyncConfig {
+	pub syncword: [u8; 8],
+	pub len: u8,
+	pub diff: u8,
+	pub condition: bool,
+	pub on: bool
+}
+impl From<&[u8; 9]> for SyncConfig {
+	fn from(bytes: &[u8; 9]) -> Self {
+		let mut ret = SyncConfig::default();
+		ret.on = bytes[0] & 0x80 != 0;
+		ret.condition = bytes[0] & 0x40 != 0;
+		ret.len = (bytes[0] & 0x38) >> 3;
+		ret.diff = bytes[0] & 0x07;
+		for (i, v) in bytes[1..9].iter().enumerate() {
+			ret.syncword[i + 1] = *v;	
+		}
+		ret
+	}
+}
+
+
+impl Default for SyncConfig {
+	fn default() -> Self {
+		SyncConfig { 
+			syncword: [1; 8], 
+			len:  4,
+			diff: 0,
+			condition: false,
+			on: true
+		}
+	}
+}
