@@ -21,6 +21,23 @@ impl From<std::io::Error> for Error {
 	}
 }
 
+#[inline]
+fn bit(byte: u8, bit: u8) -> bool {
+	byte & (1 << bit) != 0
+}
+#[inline]
+fn set_bit(byte: u8, bit: u8) -> u8 {
+	byte | (1 << bit) 
+}
+#[inline]
+fn unset_bit(byte: u8, bit: u8) -> u8 {
+	byte & 0xFE_u8.rotate_left(bit as u32)
+}
+#[inline] 
+fn cond_set_bit(byte: u8, bit: u8, cond: bool) -> u8 {
+	byte | ((1 << bit) & (cond as u8))
+}
+
 #[cfg(test)]
 mod tests {
 	use gpio_cdev::Chip;

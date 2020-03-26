@@ -1,8 +1,10 @@
 
 
-use gpio_cdev::{Line,LineHandle,LineRequestFlags};
+use gpio_cdev::{Line,LineHandle,LineRequestFlags,EventRequestFlags,LineEventHandle};
 use spidev::{Spidev,SpidevTransfer,SpidevOptions,SpiModeFlags};
-use crate::Error;
+use crate::{bit,cond_set_bit,set_bit,Error};
+use num_traits::FromPrimitive;
+use num_derive::FromPrimitive;
 use std::convert::TryInto;
 use std::thread::sleep;
 use std::time::Duration;
@@ -10,14 +12,46 @@ use std::time::Duration;
 pub struct Rfm69 {
 	rst: LineHandle,
 	en: LineHandle,
-	g0: LineHandle,
+	dios: [Option<Line>; 6],
 	spi: Spidev,
-	_g1: Option<LineHandle>,
-	_g2: Option<LineHandle>,
-	_g3: Option<LineHandle>,
-	_g4: Option<LineHandle>,
-	_g5: Option<LineHandle>,
-	verbose: bool
+	verbose: bool,
+	pc: PacketConfig,
+	mode: Mode,
+	dio_maps: [u8; 6],
+	fifo_thresh: u8
+}
+struct IrqWait<'a> {
+	line: Option<LineEventHandle>,
+	irq: Irq,
+	rf: &'a Rfm69,
+	high: bool
+}
+impl IrqWait<'_> {
+	fn wait(&self, check: Duration) -> Result<(), Error> {
+		if let Some(leh) = &self.line {
+			leh.get_event()?;
+		} else {
+			let flags = self.rf.read(Register::from_u8(Register::IrqFlags1 as u8 + (self.irq as u8) / 8).unwrap())?;
+			while bit(flags, self.irq as u8 % 8) != self.high {
+				sleep(check);	
+			}
+		}
+		Ok(())
+	}
+	fn check(&self) -> Result<bool,Error> {
+		if let Some(leh) = &self.line {
+			Ok((leh.get_value()? != 0) == self.high)
+		} else {
+			let flags = self.rf.read(Register::from_u8(Register::IrqFlags1 as u8 + (self.irq as u8) / 8).unwrap())?;
+			Ok(bit(flags, self.irq as u8 % 8) == self.high)
+		}
+	}
+	fn check_and_wait(&self, check: Duration) -> Result<(), Error> {
+		if !self.check()? {
+			self.wait(check)?;
+		}
+		Ok(())
+	}
 }
 
 const FXOSC: u32 = 32_000_000;
@@ -34,9 +68,6 @@ impl Rfm69 {
 		sleep(Duration::from_millis(5)); // let settle 
 
 		let en = en.request(flags, 1, "rfm69_enable")?;
-		let flags = LineRequestFlags::INPUT;
-		let g0 = g0.request(flags, 0, "rfm69_g0")?;
-
 
 		let options = SpidevOptions::new()
 			.bits_per_word(8)
@@ -45,8 +76,10 @@ impl Rfm69 {
 			.build();
 
 		spi.configure(&options)?;
-
-		let rfm = Rfm69 { spi, rst, en , g0, _g1: None, _g2: None, _g3: None, _g4: None, _g5: None, verbose: false };
+		let mut dios = [None, None, None, None, None, None];
+		dios[0] = Some(g0);
+		let rfm = Rfm69 { spi, rst, en, dios, verbose: false, 
+			pc: PacketConfig::default(), mode: Mode::Standby, dio_maps: [0; 6] , fifo_thresh: 15 };
 		rfm.validate_dev()?;
 		Ok(rfm)
 	}
@@ -146,8 +179,8 @@ impl Rfm69 {
 			Err(Error::BadInputs("The allowed bit diff must be length must be [0,7]".to_string()))
 		} else {
 			let mut v = [0; 9];
-			v[0] = 0x80 * config.on as u8;
-			v[0] |= 0x40 * config.condition as u8;
+			v[0] = cond_set_bit(0, 7, config.on);
+			v[0] = cond_set_bit(v[0], 6, config.condition);
 			v[0] |= (config.len - 1) << 3;
 			v[0] |= config.diff;
 			for (i, n) in config.syncword.iter().enumerate() {
@@ -175,6 +208,152 @@ impl Rfm69 {
 		}
 		Err(Error::Timeout("Temperature reading timed out!".to_string()))
 	}
+	pub fn set_config(&mut self, config: &PacketConfig) -> Result<(), Error> {
+		// validate config
+		config.validate()?;
+
+		// set config
+		let mut buf = [0; 4];
+		buf[0] = 0x80 * config.variable as u8; // bit 7
+		buf[0] |= (config.dc & 0x03) << 5; // bit 6-5
+		buf[0] |= (config.crc as u8) << 4; // bit 4
+		buf[0] |= (config.clear as u8) << 3; // bit 3
+		buf[0] |= (config.filtering & 0x03) << 1; // bit 2-1
+		buf[1] = config.length;
+		buf[2] = config.address;
+		buf[3] = config.broadcast;
+		self.write_many(Register::PacketConfig1, &buf)?;
+
+		let mut buf = [0, 0];
+		buf[0] = 0x80 * config.variable as u8; // bit 7
+		buf[0] |= 0x7F & config.thresh; // bit 6-0
+		buf[1] = (0x0F & config.delay) << 4; //bit 7-4
+		buf[1] |= (config.restart as u8) << 1; // bit 1
+		buf[1] |= config.aes as u8;  // bit 0
+		self.write_many(Register::FifoThresh, &mut buf)?;
+		self.pc = *config;
+		Ok(())
+
+	}
+	fn config(&self) -> PacketConfig {
+		self.pc
+	}
+	fn get_fifo_full(&self) -> Result<IrqWait, Error> {
+		let mut irq = IrqWait { line: None, rf: self, irq: Irq::FifoFull, high: false };
+		if let Some(line) = &self.dios[1] {
+			if self.dio_maps[1] == 0 {
+				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::FALLING_EDGE, "rfm69_g1")?;
+				irq.line = Some(leh);
+				return Ok(irq);
+			}
+		} 
+		if let Some(line) = &self.dios[3] {
+			if self.dio_maps[3] == 0 {
+				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::FALLING_EDGE, "rfm69_g3")?;
+				irq.line = Some(leh);
+				return Ok(irq);
+			}
+
+		}
+		Ok(irq)
+	}
+	fn get_mode_ready(&self) -> Result<IrqWait, Error> {
+		let mut irq = IrqWait { line: None, rf: self, irq: Irq::FifoFull, high: true };
+		if let Some(line) = &self.dios[4] {
+			if self.mode == Mode::Tx && self.dio_maps[4] == 0 {
+				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::FALLING_EDGE, "rfm69_g4")?;
+				irq.line = Some(leh);
+				return Ok(irq);
+			}
+
+		}
+		if let Some(line) = &self.dios[5] {
+			if self.dio_maps[5] == 3 {
+				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::FALLING_EDGE, "rfm69_g5")?;
+				irq.line = Some(leh);
+				return Ok(irq);
+
+			}
+		}
+		Ok(irq)
+	}
+	fn fifo_write(&self, buf: &[u8]) -> Result<(), Error> {
+		// write inits bytes to fifo
+		let mut sent = 0;
+		let first = usize::min(buf.len(), 66);
+		self.write_many(Register::Fifo, &buf[0..first]);
+		sent += first;
+		// ensure mode is ready before writing more
+		let mut ready = self.get_mode_ready()?;
+		ready.check_and_wait(Duration::from_millis(1))?;
+		drop(ready);
+
+		// send remaining bytes if there are any
+		let mut iw = self.get_fifo_full()?;
+		while sent < buf.len() {
+			iw.check_and_wait(Duration::from_micros(300))?; // we need to check if the fifo is full
+			self.write(Register::Fifo, buf[sent])?;
+			sent += 1;
+		}
+		Ok(())
+
+	}
+	fn send_fixed(&self, buf: &[u8]) -> Result<(), Error> {
+		if buf.len() == self.pc.length as usize {
+			self.fifo_write(buf)
+		} else {
+			Err(Error::BadInputs(format!("Buffer length ({}) must match fixed length ({})!", buf.len(), self.pc.length)))
+		}
+	}
+
+	fn send_variable(&self, payload: &[u8]) -> Result<(), Error> {
+		if payload.len() > 256 {
+			return Err(Error::BadInputs(format!("Buffer length ({}) cannot be greater than 255!", payload.len())));
+		} else if self.pc.aes {
+			if self.pc.filtering != 0 {
+				if payload.len() > 50 {
+					return Err(Error::BadInputs("When AES is enabled with filterin, payload length must be less than 51".to_string()));
+				}
+			}
+			else if payload.len() > 65 {
+				return Err(Error::BadInputs("When AES is enabled, payload length must be less than 66".to_string()));
+			}
+			
+		} else if self.pc.variable && payload.len() - 1 != payload[0] as usize {
+			return Err(Error::BadInputs("When using the variable length format, the first byte must be the length of the buffer.".to_string()));
+		}
+
+		self.fifo_write(payload)
+	}
+	fn send_unlimited(&self, payload: &[u8]) -> Result<(), Error> {
+		unimplemented!()	
+	}
+	pub fn send(&mut self, payload: &[u8]) -> Result<(), Error> {
+		self.set_mode_internal(Mode::Tx)?;
+		if self.pc.variable { // variable packet
+			self.send_variable(payload)
+		} else if self.pc.is_unlimited() {
+			self.send_unlimited(payload)
+		} else {  // fixed length
+			self.send_fixed(payload)
+		}
+	}
+	fn set_mode_internal(&mut self, mode: Mode) -> Result<(), std::io::Error> {
+		if self.mode == mode {
+			Ok(())
+		} else if self.mode == Mode::Listen {
+			self.write(Register::OpMode, set_bit(mode as u8, 5))?;
+			self.write(Register::OpMode, mode as u8)
+		} else {
+			self.write(Register::OpMode, mode as u8)	
+		}
+	}
+	pub fn set_mode(&mut self, mode: Mode) -> Result<(), Error> {
+		self.set_mode_internal(mode)?;
+		// wait for mode to be set
+		let iw = self.get_mode_ready()?;
+		iw.check_and_wait(Duration::from_millis(1))
+	}
 }
 impl Drop for Rfm69 {
 	fn drop(&mut self) {
@@ -191,6 +370,7 @@ impl Drop for Rfm69 {
 	}
 }
 
+#[derive(FromPrimitive)]
 pub enum Register {
     Fifo = 0x00,
     OpMode = 0x01,
@@ -311,3 +491,112 @@ impl Default for SyncConfig {
 		}
 	}
 }
+
+#[derive(Clone,Copy)]
+pub struct PacketConfig {
+	pub variable: bool,
+	pub length: u8,
+	pub dc: u8,
+	pub crc: bool,
+	pub clear: bool,
+	pub filtering: u8,
+	pub address: u8,
+	pub broadcast: u8,
+	pub aes: bool,
+	pub restart: bool,
+	pub delay: u8,
+	pub start: bool,
+	pub thresh: u8
+}
+impl PacketConfig {
+	pub fn is_fixed(&self) -> bool {
+		(!self.variable) && (self.length !=0)
+	}
+	pub fn is_unlimited(&self) -> bool {
+		(!self.variable) && (self.length == 0)
+	}
+	pub fn validate(&self) -> Result<(), Error> {
+		if self.aes { // perform aes validations
+			// variable length validation is done when sedning messages, not configuring
+			if self.is_unlimited() {
+				return Err(Error::BadInputs("AES and unlimited packet size are incompatiable.".to_string()));
+			}
+			if self.is_fixed() {
+				if self.filtering != 1 {
+					if  self.length >= 66 {
+						return Err(Error::BadInputs("In fixed mode, when AES is enabled and filtering enabled, length must be less than 66".to_string()));
+					}
+				} else {
+					if self.length >= 65 {
+						return Err(Error::BadInputs("In fixed mode, when AES is enabled and filtering disabled, length must be less than 65".to_string()));
+
+					}
+				}
+			}
+		}
+		Ok(())
+	}
+}
+pub struct FifoConfig {
+
+}
+fn byte_to_binary(u: u8) {
+	for i in 0..8 {
+		let shift = 1 << i;
+		print!("{}", (u & shift) / shift);
+	}
+	println!("\n76543210");
+}
+
+impl Default for PacketConfig {
+	fn default() -> Self {
+		PacketConfig {
+			variable: false,
+			dc: 0x00,
+			crc: true,
+			clear: false,
+			length: 0x40,
+			filtering: 0x00,
+			address: 0x00,
+			broadcast: 0x00,
+			delay: 0x00,
+			aes: false,
+			restart: true,
+			start: true,
+			thresh: 0x0F
+		}
+	}
+}
+
+#[derive(PartialEq,Clone,Copy)]
+pub enum Mode {
+	Listen = 0x40,
+	Sleep = 0x00,
+	Standby = 0x04,
+	FS = 0x08,
+	Tx = 0x0C,
+	Rx = 0x10
+}
+
+#[derive(PartialEq,Clone,Copy)]
+pub enum Irq {
+	ModeReady = 0x0F,
+	RxReady = 0x0E,
+	TxReady = 0x0D,
+	PllLock = 0x0C,
+	Rssi =  0x0B,
+	Timeout = 0x0A,
+	AutoMode = 0x09,
+	SyncAddressMatch = 0x08,
+	FifoFull = 0x07,
+	FifoNotEmpty = 0x06,
+	FifoLevel = 0x05,
+	FifoOverrun = 0x04,
+	PacketSent = 0x03,
+	PayloadReady = 0x02,
+	CrcOk = 0x01
+}
+
+
+
+	
