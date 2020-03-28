@@ -71,7 +71,8 @@ impl IrqWait<'_> {
 		if let Some(leh) = &self.line {
 			Ok((leh.get_value()? != 0) == self.high)
 		} else {
-			let flags = self.rf.read(Register::from_u8(Register::IrqFlags1 as u8 + (self.irq as u8) / 8).unwrap())?;
+			let reg = Register::from_u8(Register::IrqFlags1 as u8 + (self.irq as u8) / 8).unwrap();
+			let flags = self.rf.read(reg)?;
 			Ok(bit(flags, self.irq as u8 % 8) == self.high)
 		}
 	}
@@ -260,14 +261,26 @@ impl Rfm69 {
 	fn get_fifo_not_empty(&self) -> Result<IrqWait, Error> {
 		unimplemented!();	
 	}
-	fn get_payload_ready(&self) -> Result<IrqWait,Error> {
-		let mut irq = IrqWait { line: None, rf: self, irq: Irq::PayloadReady, high: false };
+	fn get_packet_sent(&self) -> Result<IrqWait, Error> {
+		let mut irq = IrqWait { line: None, rf: self, irq: Irq::PacketSent, high: true };
 		if let Some(line) = &self.dios[0] {
-			if self.mode == Mode::Rx && ((self.pc.crc && self.dio_maps[0] == 0) || (self.dio_maps[0] == 1)) {
-				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::FALLING_EDGE, "rfm69_g0")?;
+			if self.mode == Mode::Tx && self.dio_maps[0] == 0 {
+				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::RISING_EDGE, "rfm69_g0")?;
 				irq.line = Some(leh);
 			}
 		}
+		Ok(irq)
+
+	}
+	fn get_payload_ready(&self) -> Result<IrqWait,Error> {
+		let mut irq = IrqWait { line: None, rf: self, irq: Irq::PayloadReady, high: true };
+		if let Some(line) = &self.dios[0] {
+			if self.mode == Mode::Rx && ((self.pc.crc && self.dio_maps[0] == 0) || (self.dio_maps[0] == 1)) {
+				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::RISING_EDGE, "rfm69_g0")?;
+				irq.line = Some(leh);
+			}
+		}
+		if self.pc.crc { irq.irq = Irq::CrcOk; }
 		Ok(irq)
 
 	}
@@ -295,7 +308,7 @@ impl Rfm69 {
 		let mut irq = IrqWait { line: None, rf: self, irq: Irq::ModeReady, high: true };
 		if let Some(line) = &self.dios[4] {
 			if self.mode == Mode::Tx && self.dio_maps[4] == 0 {
-				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::FALLING_EDGE, "rfm69_g4")?;
+				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::RISING_EDGE, "rfm69_g4")?;
 				irq.line = Some(leh);
 				return Ok(irq);
 			}
@@ -303,7 +316,7 @@ impl Rfm69 {
 		}
 		if let Some(line) = &self.dios[5] {
 			if self.dio_maps[5] == 3 {
-				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::FALLING_EDGE, "rfm69_g5")?;
+				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::RISING_EDGE, "rfm69_g5")?;
 				irq.line = Some(leh);
 				return Ok(irq);
 
@@ -335,7 +348,10 @@ impl Rfm69 {
 	}
 	fn send_fixed(&self, buf: &[u8]) -> Result<(), Error> {
 		if buf.len() == self.pc.length as usize {
-			self.fifo_write(buf)
+			self.fifo_write(buf)?;
+			let fifo_wait = Duration::from_secs_f64(66.0 * 80.0 / self.bitrate as f64); // 80.0 comes from 8 bits in and a byte x10
+
+			self.get_packet_sent()?.check_and_wait(fifo_wait)
 		} else {
 			Err(Error::BadInputs(format!("Buffer length ({}) must match fixed length ({})!", buf.len(), self.pc.length)))
 		}
@@ -408,7 +424,7 @@ impl Rfm69 {
 	}
 	fn recv_variable(&self, timeout: Duration) -> Result<Vec<u8>, Error> {
 		let irq = self.get_fifo_not_empty()?;
-		irq.check_and_wait(timeout);
+		irq.check_and_wait(timeout)?;
 		let len = self.read(Register::Fifo)?;
 		if len <= 66 {
 			let irq = self.get_payload_ready()?;
@@ -695,21 +711,21 @@ pub enum Mode {
 
 #[derive(PartialEq,Clone,Copy,Debug)]
 pub enum Irq {
-	ModeReady = 0x0F,
-	RxReady = 0x0E,
-	TxReady = 0x0D,
-	PllLock = 0x0C,
-	Rssi =  0x0B,
-	Timeout = 0x0A,
-	AutoMode = 0x09,
-	SyncAddressMatch = 0x08,
-	FifoFull = 0x07,
-	FifoNotEmpty = 0x06,
-	FifoLevel = 0x05,
-	FifoOverrun = 0x04,
-	PacketSent = 0x03,
-	PayloadReady = 0x02,
-	CrcOk = 0x01
+	ModeReady = 0x07,
+	RxReady = 0x06,
+	TxReady = 0x05,
+	PllLock = 0x04,
+	Rssi =  0x03,
+	Timeout = 0x02,
+	AutoMode = 0x01,
+	SyncAddressMatch = 0x00,
+	FifoFull = 0x0F,
+	FifoNotEmpty = 0x0E,
+	FifoLevel = 0x0D,
+	FifoOverrun = 0x0C,
+	PacketSent = 0x0B,
+	PayloadReady = 0x0A,
+	CrcOk = 0x09
 }
 
 
