@@ -6,8 +6,11 @@ use crate::{bit,cond_set_bit,set_bit,Error};
 use num_traits::FromPrimitive;
 use num_derive::FromPrimitive;
 use std::convert::TryInto;
+use std::os::unix::io::AsRawFd;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Instant,Duration};
+use std::convert::TryFrom;
+use nix::poll;
 
 pub struct Rfm69 {
 	rst: LineHandle,
@@ -18,7 +21,8 @@ pub struct Rfm69 {
 	pc: PacketConfig,
 	mode: Mode,
 	dio_maps: [u8; 6],
-	fifo_thresh: u8
+	fifo_thresh: u8,
+	bitrate: u32,
 }
 struct IrqWait<'a> {
 	line: Option<LineEventHandle>,
@@ -27,16 +31,41 @@ struct IrqWait<'a> {
 	high: bool
 }
 impl IrqWait<'_> {
-	fn wait(&self, check: Duration) -> Result<(), Error> {
+	fn wait(&self, timeout: Duration) -> Result<(), Error> {
 		if let Some(leh) = &self.line {
-			leh.get_event()?;
+			let fd = leh.as_raw_fd();
+			let pf = poll::PollFd::new(fd, poll::PollFlags::POLLIN);	
+			let mut c_timeout = timeout.as_millis();
+			if timeout.as_nanos() % 1_000_000 > 0 { c_timeout += 1 } // round up time
+			match poll::poll(&mut [pf], c_timeout.try_into().unwrap()) {
+				Ok(i) => if i > 0 { // an interrupt event occurred
+					Ok(())
+				} else { // no interrupt occured
+					Err(Error::Timeout("Interrupt poll timeout!".to_string())) 
+				},
+				Err(e) => Err(Error::Timeout(format!("Interrupt poll error ({:?})!", e))) // a poll error
+			}
 		} else {
-			let flags = self.rf.read(Register::from_u8(Register::IrqFlags1 as u8 + (self.irq as u8) / 8).unwrap())?;
-			while bit(flags, self.irq as u8 % 8) != self.high {
+			let check = timeout / 10;
+			let start = Instant::now();
+			let reg = Register::from_u8(Register::IrqFlags1 as u8 + (self.irq as u8) / 8).unwrap();
+			let b = self.irq as u8 % 8;
+			while Instant::now().duration_since(start) < timeout {
+				let flags = self.rf.read(reg)?;
+				if bit(flags, b) == self.high {
+					return Ok(())
+				}
 				sleep(check);	
 			}
+			#[cfg(test)]{
+				let reg = self.rf.read_all()?;
+				for i in reg.iter().enumerate() {
+					let reg = Register::from_usize(i.0 + 1).unwrap();
+					eprintln!("{:>15?}: {:#04x}", reg, i.1);
+				}
+			}
+			Err(Error::Timeout(format!("Interrupt ({:?}) timeout!", self.irq)))
 		}
-		Ok(())
 	}
 	fn check(&self) -> Result<bool,Error> {
 		if let Some(leh) = &self.line {
@@ -46,12 +75,14 @@ impl IrqWait<'_> {
 			Ok(bit(flags, self.irq as u8 % 8) == self.high)
 		}
 	}
-	fn check_and_wait(&self, check: Duration) -> Result<(), Error> {
+
+	fn check_and_wait(&self, timeout: Duration) -> Result<(), Error> {
 		if !self.check()? {
-			self.wait(check)?;
+			self.wait(timeout)?;
 		}
 		Ok(())
 	}
+	fn is_true_irq(&self) -> bool { self.line.is_some() }
 }
 
 const FXOSC: u32 = 32_000_000;
@@ -60,7 +91,7 @@ const MIN_FREQ: u32 = 290_000_000;
 const MAX_FREQ: u32 = 1020_000_000;
 
 impl Rfm69 {
-	pub fn new(rst: Line, en: Line, g0: Line, mut spi: Spidev) -> Result<Self, Error> {
+	pub fn new(rst: Line, en: Line, mut spi: Spidev) -> Result<Self, Error> {
 		let flags = LineRequestFlags::OUTPUT;
 		let rst = rst.request(flags, 1, "rfm69_reset")?;
 		sleep(Duration::from_millis(1)); // let settle
@@ -76,9 +107,8 @@ impl Rfm69 {
 			.build();
 
 		spi.configure(&options)?;
-		let mut dios = [None, None, None, None, None, None];
-		dios[0] = Some(g0);
-		let rfm = Rfm69 { spi, rst, en, dios, verbose: false, 
+		let dios = [None, None, None, None, None, None];
+		let rfm = Rfm69 { spi, rst, en, dios, verbose: false, bitrate: 4800,
 			pc: PacketConfig::default(), mode: Mode::Standby, dio_maps: [0; 6] , fifo_thresh: 15 };
 		rfm.validate_dev()?;
 		Ok(rfm)
@@ -121,10 +151,8 @@ impl Rfm69 {
 	}
 	fn write_many(&self, reg: Register, buf: &[u8]) -> Result<(), std::io::Error> {
 		let reg = [(reg as u8) | 0x80];
-		let mut addr_xfer = SpidevTransfer::write(&reg);
-		addr_xfer.cs_change = 1;
-		let mut write_xfer = SpidevTransfer::write(buf);
-		write_xfer.cs_change = 0;
+		let addr_xfer = SpidevTransfer::write(&reg);
+		let write_xfer = SpidevTransfer::write(buf);
 		let mut xfers = [addr_xfer, write_xfer];
 		self.spi.transfer_multiple(&mut xfers)
 	}
@@ -136,21 +164,25 @@ impl Rfm69 {
 		self.read_many(Register::OpMode, &mut ret)?;
 		Ok(ret)
 	}
-	pub fn set_bitrate(&self, bitrate: u32) -> Result<(), Error> {
+	pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), Error> {
 		if let Ok(v) = ((FXOSC as f64 / bitrate as f64).round() as u64).try_into() {
 			let v: u16 = v;
 			self.write_many(Register::BitrateMsb, &v.to_be_bytes())?;
+			self.bitrate = bitrate;
 			Ok(())
 		} else {
 			Err(Error::BadInputs("Bitrate out of bounds!".to_string()))
 		}
 	}
-	pub fn bitrate(&self) -> Result<u32, Error> {
+	pub fn bitrate_dev(&self) -> Result<u32, Error> {
 		let mut v = [0, 0];	
 		self.read_many(Register::BitrateMsb, &mut v)?;
 		let v = u16::from_be_bytes(v);
 		let v = (FXOSC as f64 / v as f64).round() as u32;
 		Ok(v)
+	}
+	pub fn bitrate(&self) -> u32 {
+		self.bitrate
 	}
 	pub fn set_frequency(&self, frequency: u32) -> Result<(), Error> {
 		if frequency < MIN_FREQ {
@@ -173,28 +205,14 @@ impl Rfm69 {
 		Ok(ret)
 	}
 	pub fn set_sync(&self, config: &SyncConfig) -> Result<(), Error> {
-		if config.len > 8 {
-			Err(Error::BadInputs("The syncword length must be [0,8]".to_string()))
-		} else if config.diff > 7 {
-			Err(Error::BadInputs("The allowed bit diff must be length must be [0,7]".to_string()))
-		} else {
-			let mut v = [0; 9];
-			v[0] = cond_set_bit(0, 7, config.on);
-			v[0] = cond_set_bit(v[0], 6, config.condition);
-			v[0] |= (config.len - 1) << 3;
-			v[0] |= config.diff;
-			for (i, n) in config.syncword.iter().enumerate() {
-				v[i + 1] = *n;	
-			}
-			self.write_many(Register::SyncConfig, &v)?;
-			Ok(())
-		}
+		let v: [u8; 9] = config.try_into()?;
+		self.write_many(Register::SyncConfig, &v)?;
+		Ok(())
 	}
 	pub fn sync(&self) -> Result<SyncConfig, std::io::Error> {
 		let mut buf = [0; 9];
 		self.read_many(Register::SyncConfig, &mut buf)?;
 		Ok(SyncConfig::from(&buf))
-		
 	}
 	pub fn temp(&self) -> Result<i8, Error> {
 		self.write(Register::Temp1, 0x08)?;
@@ -238,6 +256,22 @@ impl Rfm69 {
 	fn config(&self) -> PacketConfig {
 		self.pc
 	}
+
+	fn get_fifo_not_empty(&self) -> Result<IrqWait, Error> {
+		unimplemented!();	
+	}
+	fn get_payload_ready(&self) -> Result<IrqWait,Error> {
+		let mut irq = IrqWait { line: None, rf: self, irq: Irq::PayloadReady, high: false };
+		if let Some(line) = &self.dios[0] {
+			if self.mode == Mode::Rx && ((self.pc.crc && self.dio_maps[0] == 0) || (self.dio_maps[0] == 1)) {
+				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::FALLING_EDGE, "rfm69_g0")?;
+				irq.line = Some(leh);
+			}
+		}
+		Ok(irq)
+
+	}
+
 	fn get_fifo_full(&self) -> Result<IrqWait, Error> {
 		let mut irq = IrqWait { line: None, rf: self, irq: Irq::FifoFull, high: false };
 		if let Some(line) = &self.dios[1] {
@@ -258,7 +292,7 @@ impl Rfm69 {
 		Ok(irq)
 	}
 	fn get_mode_ready(&self) -> Result<IrqWait, Error> {
-		let mut irq = IrqWait { line: None, rf: self, irq: Irq::FifoFull, high: true };
+		let mut irq = IrqWait { line: None, rf: self, irq: Irq::ModeReady, high: true };
 		if let Some(line) = &self.dios[4] {
 			if self.mode == Mode::Tx && self.dio_maps[4] == 0 {
 				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::FALLING_EDGE, "rfm69_g4")?;
@@ -281,17 +315,18 @@ impl Rfm69 {
 		// write inits bytes to fifo
 		let mut sent = 0;
 		let first = usize::min(buf.len(), 66);
-		self.write_many(Register::Fifo, &buf[0..first]);
+		self.write_many(Register::Fifo, &buf[0..first])?;
 		sent += first;
 		// ensure mode is ready before writing more
-		let mut ready = self.get_mode_ready()?;
-		ready.check_and_wait(Duration::from_millis(1))?;
+		let ready = self.get_mode_ready()?;
+		ready.check_and_wait(Duration::from_millis(10))?;
 		drop(ready);
 
 		// send remaining bytes if there are any
-		let mut iw = self.get_fifo_full()?;
+		let iw = self.get_fifo_full()?;
+		let fifo_wait = Duration::from_secs_f64(80.0 / self.bitrate as f64); // 80.0 comes from 8 bits in and a byte x10
 		while sent < buf.len() {
-			iw.check_and_wait(Duration::from_micros(300))?; // we need to check if the fifo is full
+			iw.check_and_wait(fifo_wait)?; // we need to check if the fifo is full
 			self.write(Register::Fifo, buf[sent])?;
 			sent += 1;
 		}
@@ -338,6 +373,63 @@ impl Rfm69 {
 			self.send_fixed(payload)
 		}
 	}
+	fn fifo_read(&self, count: usize, timeout: Duration) -> Result<Vec<u8>, Error> {
+		let mut ret = Vec::with_capacity(count);
+		let mut recvd = 0;
+		let fifo_wait = Duration::from_secs_f64(80.0 / self.bitrate as f64); // 80.0 comes from 8 bits in and a byte x10
+		let fifo = self.get_fifo_not_empty()?;
+		fifo.check_and_wait(timeout)?;
+		while recvd + 1 < count {
+			fifo.check_and_wait(fifo_wait)?;
+			ret.push(self.read(Register::Fifo)?);
+			recvd += 1;
+		}
+		let ready = self.get_payload_ready()?;
+		ready.check_and_wait(fifo_wait)?;
+		ret.push(self.read(Register::Fifo)?);
+		Ok(ret)	
+	
+	}
+	fn fifo_read_no_check(&self, count: usize) -> Result<Vec<u8>, Error> {
+		let mut ret = vec![0; count];
+		self.read_many(Register::Fifo, &mut ret)?;
+		Ok(ret)
+	}
+	fn recv_fixed(&self, timeout: Duration) -> Result<Vec<u8>, Error> {
+		if self.pc.length <= 66 {
+			eprintln!("Doing fixed_recv() short message");
+			let irq = self.get_payload_ready()?;
+			irq.check_and_wait(timeout)?;
+			eprintln!("Doing fixed_recv() payload ready");
+			self.fifo_read_no_check(self.pc.length as usize)
+		} else {
+			self.fifo_read(self.pc.length as usize, timeout)
+		}
+	}
+	fn recv_variable(&self, timeout: Duration) -> Result<Vec<u8>, Error> {
+		let irq = self.get_fifo_not_empty()?;
+		irq.check_and_wait(timeout);
+		let len = self.read(Register::Fifo)?;
+		if len <= 66 {
+			let irq = self.get_payload_ready()?;
+			irq.check_and_wait(timeout)?;
+			self.fifo_read_no_check(self.pc.length as usize)
+		} else {
+			self.fifo_read(len as usize, timeout)
+		}
+
+	}
+	pub fn recv(&mut self, timeout: Duration) -> Result<Vec<u8>,Error> {
+		self.set_mode(Mode::Rx)?;
+		if self.pc.variable {
+			self.recv_variable(timeout)
+		} else if self.pc.is_unlimited() {
+			unimplemented!();
+		} else {
+			self.recv_fixed(timeout)
+
+		}
+	}
 	fn set_mode_internal(&mut self, mode: Mode) -> Result<(), std::io::Error> {
 		if self.mode == mode {
 			Ok(())
@@ -352,7 +444,7 @@ impl Rfm69 {
 		self.set_mode_internal(mode)?;
 		// wait for mode to be set
 		let iw = self.get_mode_ready()?;
-		iw.check_and_wait(Duration::from_millis(1))
+		iw.check_and_wait(Duration::from_millis(10))
 	}
 }
 impl Drop for Rfm69 {
@@ -370,7 +462,7 @@ impl Drop for Rfm69 {
 	}
 }
 
-#[derive(FromPrimitive)]
+#[derive(FromPrimitive,Clone,Copy,Debug)]
 pub enum Register {
     Fifo = 0x00,
     OpMode = 0x01,
@@ -458,6 +550,7 @@ pub enum Register {
     TestDagc = 0x6F,
 }
 
+#[derive(Debug,PartialEq)]
 pub struct SyncConfig {
 	pub syncword: [u8; 8],
 	pub len: u8,
@@ -467,15 +560,37 @@ pub struct SyncConfig {
 }
 impl From<&[u8; 9]> for SyncConfig {
 	fn from(bytes: &[u8; 9]) -> Self {
+		eprintln!("{:?}", bytes);
 		let mut ret = SyncConfig::default();
-		ret.on = bytes[0] & 0x80 != 0;
-		ret.condition = bytes[0] & 0x40 != 0;
-		ret.len = (bytes[0] & 0x38) >> 3;
+		ret.on = bit(bytes[0], 7);
+		ret.condition = bit(bytes[0], 6);
+		ret.len = ((bytes[0] >> 3) & 0x07) + 1;
 		ret.diff = bytes[0] & 0x07;
 		for (i, v) in bytes[1..9].iter().enumerate() {
 			ret.syncword[i] = *v;	
 		}
 		ret
+	}
+}
+impl TryFrom<&SyncConfig> for [u8; 9] {
+	type Error = Error;
+	fn try_from(sc: &SyncConfig) -> Result<Self, Self::Error> {
+		let mut ret = [0; 9];
+		ret[0] = cond_set_bit(ret[0], 7, sc.on);
+		ret[0] = cond_set_bit(ret[0], 6, sc.condition);
+		if sc.len > 8  || sc.len == 0 {
+			return Err(Error::BadInputs("Length must be [1,8].".to_string()));
+		}
+		ret[0] |= (sc.len - 1) << 3;
+		if sc.diff > 7 {
+			return Err(Error::BadInputs("Diff must be less than 8.".to_string()));
+		}
+		ret[0] |= sc.diff;
+		for (i, v) in sc.syncword.iter().enumerate() {
+			ret[i + 1] = *v;
+		}
+		eprintln!("{:?}", ret);
+		Ok(ret)
 	}
 }
 
@@ -578,7 +693,7 @@ pub enum Mode {
 	Rx = 0x10
 }
 
-#[derive(PartialEq,Clone,Copy)]
+#[derive(PartialEq,Clone,Copy,Debug)]
 pub enum Irq {
 	ModeReady = 0x0F,
 	RxReady = 0x0E,

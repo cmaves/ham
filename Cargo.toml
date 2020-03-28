@@ -9,5 +9,6 @@ edition = "2018"
 [dependencies]
 spidev = "0.4.0"
 gpio-cdev = "0.2.0"
+nix = "0.17.0"
 num-traits = "0.2.0"
 num-derive = "0.3.0"
