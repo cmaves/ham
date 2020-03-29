@@ -3,6 +3,7 @@ use crate::rfm69::{PacketConfig,Rfm69,SyncConfig};
 use spidev::Spidev;
 use std::thread::{spawn,sleep};
 use std::time::Duration;
+use rand::prelude::*;
 
 fn test_sync_config() -> SyncConfig {
 	let mut sc = SyncConfig::default();
@@ -55,10 +56,10 @@ fn sent_recv_fixed() {
 	let mut rfm1 = Rfm69::new(rst, en, spidev).unwrap();
 	let mut pc = PacketConfig::default();
 	let sc = test_sync_config();
-	pc.length = 16;
+
+	pc.set_len(16);
 	rfm1.set_config(&pc).unwrap();
 	rfm1.set_sync(&sc).unwrap();
-	
 
 	let rst = chip.get_line(2).unwrap();
 	let en = chip.get_line(4).unwrap();
@@ -66,7 +67,10 @@ fn sent_recv_fixed() {
 	let mut rfm2 = Rfm69::new(rst, en, spidev).unwrap();
 	rfm2.set_config(&pc).unwrap();
 	rfm2.set_sync(&sc).unwrap();
-	let msg: Vec<u8> = (0..16_u8).collect();
+
+	let mut msg = vec![0_u8; 16];
+	let mut rng = thread_rng();
+	rng.try_fill(msg.as_mut_slice()).unwrap();
 	let copy = msg.clone();
 	let recv = spawn(move || {
 		let recvd = rfm1.recv(Duration::from_secs(5)).unwrap();
@@ -75,6 +79,76 @@ fn sent_recv_fixed() {
 	});	
 	sleep(Duration::from_secs(1));
 	rfm2.send(&msg).unwrap();
-	recv.join().unwrap(); // check if other thread paniced
+	let mut rfm1 = recv.join().unwrap(); // check if other thread paniced
+
+	pc.set_len(32);
+	rfm1.set_config(&pc).unwrap();
+	rfm2.set_config(&pc).unwrap();
+
+	msg.resize(32, 0);
+	rng.try_fill(msg.as_mut_slice()).unwrap();
+	
+	let copy = msg.clone();
+	let recv = spawn(move || {
+		let recvd = rfm1.recv(Duration::from_secs(5)).unwrap();
+		assert_eq!(recvd,copy);
+		rfm1
+	});	
+
+	sleep(Duration::from_secs(1));
+	rfm2.send(&msg).unwrap();
+	let mut rfm1 = recv.join().unwrap();
+
+	pc.set_len(128);
+	rfm1.set_config(&pc).unwrap();
+	rfm2.set_config(&pc).unwrap();
+
+	msg.resize(128, 0);
+	rng.try_fill(msg.as_mut_slice()).unwrap();
+	let copy = msg.clone();
+	let recv = spawn(move || {
+		let recvd = rfm1.recv(Duration::from_secs(5)).unwrap();
+		assert_eq!(recvd,copy);
+		rfm1
+	});	
+
+	sleep(Duration::from_secs(1));
+	rfm2.send(&msg).unwrap();
+	let mut rfm1 = recv.join().unwrap();
+
+	pc.set_len(255);
+	rfm1.set_config(&pc).unwrap();
+	rfm2.set_config(&pc).unwrap();
+
+	msg.resize(255, 0);
+	rng.try_fill(msg.as_mut_slice()).unwrap();
+	let copy = msg.clone();
+	let recv = spawn(move || {
+		let recvd = rfm1.recv(Duration::from_secs(5)).unwrap();
+		assert_eq!(recvd,copy);
+		rfm1
+	});	
+
+	sleep(Duration::from_secs(1));
+	rfm2.send(&msg).unwrap();
+	recv.join().unwrap();
+
+}
+
+#[test]
+fn config() {
+	let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	let rst = chip.get_line(24).unwrap();
+	let en = chip.get_line(3).unwrap();
+	let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
+	let mut pc = PacketConfig::default();
+	pc.set_len(255);
+	
+	rfm.set_config(&pc).unwrap();
+	assert_eq!(pc, rfm.config());
+
+	let copy = rfm.config_dev().unwrap();
+	assert_eq!(pc, copy);
 }
 
