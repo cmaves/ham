@@ -11,7 +11,9 @@ pub enum Error {
 	InitError(String),
 	IoError(std::io::Error),
 	BadInputs(String),
-	Timeout(String)
+	BadMessage(String, Option<Vec<u8>>),
+	Timeout(String),
+	ChipMalfunction(String)
 }
 impl From<gpio_cdev::errors::Error> for Error {
 	fn from(v: gpio_cdev::errors::Error) -> Self {
@@ -39,4 +41,9 @@ fn unset_bit(byte: u8, bit: u8) -> u8 {
 #[inline] 
 fn cond_set_bit(byte: u8, bit: u8, cond: bool) -> u8 {
 	byte | ((1 << bit) * (cond as u8))
+}
+
+#[inline]
+fn set_bit_to(byte: u8, bit: u8, val: bool) -> u8 {
+	cond_set_bit(unset_bit(byte, bit), bit, val)
 }

@@ -2,7 +2,7 @@
 
 use gpio_cdev::{Line,LineHandle,LineRequestFlags,EventRequestFlags,LineEventHandle};
 use spidev::{Spidev,SpidevTransfer,SpidevOptions,SpiModeFlags};
-use crate::{bit,cond_set_bit,set_bit,Error};
+use crate::{bit,cond_set_bit,set_bit,Error,set_bit_to};
 use num_traits::FromPrimitive;
 use num_derive::FromPrimitive;
 use std::convert::TryInto;
@@ -20,6 +20,7 @@ pub struct Rfm69 {
 	spi: Spidev,
 	verbose: bool,
 	pc: PacketConfig,
+	sc: SyncConfig,
 	mode: Mode,
 	dio_maps: [u8; 6],
 	fifo_thresh: u8,
@@ -34,6 +35,12 @@ struct IrqWait<'a> {
 	check: Duration // holds the duration in which the interrupt should be polled
 }
 impl IrqWait<'_> {
+	fn check_flag(rfm: &Rfm69, irq: Irq) -> Result<bool, std::io::Error> {
+		let reg = Register::from_u8(Register::IrqFlags1 as u8 + (irq as u8) / 8).unwrap();
+		let b = irq as u8 % 8;	
+		let flags = rfm.read(reg)?;
+		Ok(bit(flags, b))
+	}
 	fn wait(&self, timeout: Duration) -> Result<(), Error> {
 		if let Some(leh) = &self.line {
 			let fd = leh.as_raw_fd();
@@ -52,14 +59,17 @@ impl IrqWait<'_> {
 			let start = Instant::now();
 			let reg = Register::from_u8(Register::IrqFlags1 as u8 + (self.irq as u8) / 8).unwrap();
 			let b = self.irq as u8 % 8;
-			while Instant::now().duration_since(start) < timeout {
+			let target = Instant::now() + timeout - self.check; // 
+			loop { // 
 				let flags = self.rf.read(reg)?;
 				if bit(flags, b) == self.high {
 					return Ok(())
 				}
+				if Instant::now() > target { break; }
 				sleep(self.check);	
 			}
-			#[cfg(test)]{
+			#[cfg(test)]
+			{
 				let reg = self.rf.read_all()?;
 				for i in reg.iter().enumerate() {
 					let reg = Register::from_usize(i.0 + 1).unwrap();
@@ -113,7 +123,8 @@ impl Rfm69 {
 
 		let dios = [None, None, None, None, None, None];
 		let mut rfm = Rfm69 { spi, rst, en, dios, verbose: false, bitrate: 4800, preamble: 0x03,
-			pc: PacketConfig::default(), mode: Mode::Standby, dio_maps: [0; 6] , fifo_thresh: 15 };
+			pc: PacketConfig::default(), mode: Mode::Standby, dio_maps: [0; 6] , fifo_thresh: 15,
+			sc: SyncConfig::default()};
 		rfm.validate_version()?;
 		rfm.configure_defaults()?;
 		Ok(rfm)
@@ -297,7 +308,7 @@ impl Rfm69 {
 		Ok(irq)
 	}
 	fn get_packet_sent(&self) -> Result<IrqWait, Error> {
-		let check = Duration::from_secs_f64(66.0 / self.bitrate as f64); 
+		let check = Duration::from_secs_f64(8.0 / self.bitrate as f64); 
 		let mut irq = IrqWait { line: None, rf: self, irq: Irq::PacketSent, high: true, check };
 		if let Some(line) = &self.dios[0] {
 			if self.mode == Mode::Tx && self.dio_maps[0] == 0 {
@@ -308,8 +319,8 @@ impl Rfm69 {
 		Ok(irq)
 
 	}
-	fn get_payload_ready(&self) -> Result<IrqWait,Error> {
-		let check = Duration::from_secs_f64(66.0 / self.bitrate as f64);
+	fn get_payload_crc(&self) -> Result<IrqWait,Error> {
+		let check = Duration::from_secs_f64(8.0 / self.bitrate as f64);
 		let mut irq = IrqWait { line: None, rf: self, irq: Irq::PayloadReady, high: true, check };
 		if let Some(line) = &self.dios[0] {
 			if self.mode == Mode::Rx && ((self.pc.crc() && self.dio_maps[0] == 0) || (self.dio_maps[0] == 1)) {
@@ -320,6 +331,17 @@ impl Rfm69 {
 		if self.pc.crc() { irq.irq = Irq::CrcOk; }
 		Ok(irq)
 
+	}
+	fn get_payload_ready(&self) -> Result<IrqWait,Error> {
+		let check = Duration::from_secs_f64(8.0 / self.bitrate as f64);
+		let mut irq = IrqWait { line: None, rf: self, irq: Irq::PayloadReady, high: true, check };
+		if let Some(line) = &self.dios[0] {
+			if self.mode == Mode::Rx && self.dio_maps[0] == 1 {
+				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::RISING_EDGE, "rfm69_g0")?;
+				irq.line = Some(leh);
+			}
+		}
+		Ok(irq)
 	}
 
 	fn get_fifo_full(&self) -> Result<IrqWait, Error> {
@@ -363,6 +385,26 @@ impl Rfm69 {
 		}
 		Ok(irq)
 	}
+	fn get_sync_address(&self) -> Result<IrqWait, Error> {
+		let check = Duration::from_secs_f64(8.0 / self.bitrate as f64);
+		let mut irq = IrqWait { line: None, rf: self, irq: Irq::SyncAddressMatch, high: true, check };
+		if let Some(line) = &self.dios[0] {
+			if self.mode == Mode::Rx && self.dio_maps[0] == 0x2 {
+				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::RISING_EDGE, "rfm69_g0")?;
+				irq.line = Some(leh);
+				return Ok(irq);
+			}
+		}
+		if let Some(line) = &self.dios[3] {
+			if self.mode == Mode::Rx && self.dio_maps[3] == 0x2 {
+				let leh = line.events(LineRequestFlags::INPUT, EventRequestFlags::RISING_EDGE, "rfm69_g0")?;
+				irq.line = Some(leh);
+				return Ok(irq);
+			}
+		}
+		Ok(irq)
+
+	}
 	fn fifo_write(&self, buf: &[u8]) -> Result<(), Error> {
 		// write inits bytes to fifo
 		let mut sent = 0;
@@ -387,10 +429,7 @@ impl Rfm69 {
 	}
 	fn send_fixed(&self, buf: &[u8]) -> Result<(), Error> {
 		if buf.len() == self.pc.len() as usize {
-			self.fifo_write(buf)?;
-			let fifo_wait = Duration::from_secs_f64((78.0 + self.preamble as f64)  * 8.0 * 5.0 / self.bitrate as f64); // 78.0 comes from the fifo length + sync word length + crc bytes + address bytes + length byte
-
-			self.get_packet_sent()?.check_and_wait(fifo_wait)
+			self.fifo_write(buf)
 		} else {
 			Err(Error::BadInputs(format!("Buffer length ({}) must match fixed length ({})!", buf.len(), self.pc.len())))
 		}
@@ -426,60 +465,112 @@ impl Rfm69 {
 			self.send_unlimited(payload)
 		} else {  // fixed length
 			self.send_fixed(payload)
-		}
+		}?;
+		let send_timeout = Duration::from_secs_f64((273.0 + self.preamble as f64) * 8.0 / self.bitrate as f64);
+		self.get_packet_sent()?.check_and_wait(send_timeout)
 	}
 	fn fifo_read(&self, count: usize, timeout: Duration) -> Result<Vec<u8>, Error> {
+		#[cfg(test)]
 		eprintln!("fifo_read(): {}", count);
 		let mut ret = Vec::with_capacity(count);
-		let mut recvd = 0;
+		// wait for the byte to be received
 		let fifo = self.get_fifo_not_empty()?;
 		fifo.check_and_wait(timeout)?;
+
+		// loop bytes
 		eprintln!("reception started");
-		let fifo_wait = Duration::from_secs_f64(80.0 / self.bitrate as f64); // 80.0 comes from 8 bits in and a byte x10
-		while recvd + 1 < count {
+		let fifo_wait = Duration::from_secs_f64(160.0 / self.bitrate as f64); // 80.0 comes from 8 bits in and a byte x10
+		for i in 0..(count-1) {
 			if let Err(e) = fifo.check_and_wait(fifo_wait) {
-				if self.get_fifo_overrun()?.check()? { 
+				if IrqWait::check_flag(&self, Irq::FifoOverrun)? {
 					return Err(Error::Timeout("Fifo overran while reading! Reading was too slow.".to_string()));
 				} else {
 					return Err(e);
 				}
 			}
-			eprintln!("getting byte {}", recvd);
 			ret.push(self.read(Register::Fifo)?);
-			recvd += 1;
 		}
-		let ready = self.get_payload_ready()?;
-		ready.check_and_wait(fifo_wait)?;
-		ret.push(self.read(Register::Fifo)?);
-		Ok(ret)	
+		// at this point either CrcOk or PayloadReady should fire
+		let ready = self.get_payload_crc()?;
+		if let Err(e) = ready.check_and_wait(fifo_wait) { 
+			/* if the sync word and address didnt match we would have timed-out above so we dont need to check
+			   sync word interrupt.
+			 */ 
+			let s = if self.pc.crc() { 
+				// check if this is a Crc Error or something else
+				"A CRC Error occurred!".to_string()
+			} else { 
+				let s = "A payload ready was never received, after starting message reception. With no CRC, this should never happen.".to_string();
+				return Err(Error::ChipMalfunction(s));
+			};
+			let bad_fifo = if !self.pc.clear()  {
+				//if clear is not set we should get the bad payload 
+				ret.push(self.read(Register::Fifo)?);
+				Some(ret)
+			} else { None };
+			Err(Error::BadMessage(s, bad_fifo))
+		} else { 
+			ret.push(self.read(Register::Fifo)?);
+			Ok(ret)	
+		}
 	
 	}
-	fn fifo_read_no_check(&self, count: usize) -> Result<Vec<u8>, Error> {
+	fn fifo_read_no_check(&self, count: usize, timeout: Duration) -> Result<Vec<u8>, Error> {
 		let mut ret = vec![0; count];
-		self.read_many(Register::Fifo, &mut ret)?;
-		Ok(ret)
+		let irq = self.get_payload_crc()?;
+		if let Err(e) = irq.check_and_wait(timeout) {
+			if self.sc.on || self.pc.filtering() != 0 {
+				if !IrqWait::check_flag(&self, Irq::SyncAddressMatch)? {
+					// the sync and address never seen, normal timeout
+					return Err(e);
+
+				}
+			} else {
+				// if the sync and address filtering are disabled then this is a normal timeout
+				return Err(e);
+			}
+			// From here on, it can be assumed a sync word or address was received
+			if !self.pc.crc() {
+				/* If CRC error didnt happen then it is something else
+				   I don't know if this is even possible. Should this be unreachable arm instead?
+				   With out CRC checking anything would be accept, so this are would represent a chip 
+				   malfunction.
+			     */ 
+				let s = "A payload ready was never received, after starting message reception. With no CRC, this should never happen.".to_string();
+				return Err(Error::ChipMalfunction(s));
+			}
+			let s = "A CRC Error occured!".to_string();
+			let bad_fifo = if !self.pc.clear() {
+				// if clear is not set we should get bad payload for error message
+				self.read_many(Register::Fifo, &mut ret[..])?;
+				Some(ret)
+			} else { None };
+			Err(Error::BadMessage(s, bad_fifo))
+		} else {
+			self.read_many(Register::Fifo, &mut ret)?;
+			Ok(ret)
+		}
 	}
 	fn recv_fixed(&self, timeout: Duration) -> Result<Vec<u8>, Error> {
-		if self.pc.len() <= 66 {
+		let len = self.pc.len() as usize;
+		if len <= 66 {
+			// short messages can be read in one go
 			eprintln!("Doing fixed_recv() short message");
-			let irq = self.get_payload_ready()?;
-			irq.check_and_wait(timeout)?;
-			eprintln!("Doing fixed_recv(): {:?} ready", irq.irq);
-			self.fifo_read_no_check(self.pc.len() as usize)
+			self.fifo_read_no_check(len, timeout)
 		} else {
-			self.fifo_read(self.pc.len() as usize, timeout)
+			// long messages are required to be read continously
+			self.fifo_read(len as usize, timeout)
 		}
 	}
 	fn recv_variable(&self, timeout: Duration) -> Result<Vec<u8>, Error> {
 		let irq = self.get_fifo_not_empty()?;
 		irq.check_and_wait(timeout)?;
-		let len = self.read(Register::Fifo)?;
+		let len = self.read(Register::Fifo)? as usize;
 		if len <= 66 {
-			let irq = self.get_payload_ready()?;
-			irq.check_and_wait(timeout)?;
-			self.fifo_read_no_check(self.pc.len() as usize)
+			eprintln!("Doing variable_recv() short message {}", len);
+			self.fifo_read_no_check(len, timeout)
 		} else {
-			self.fifo_read(len as usize, timeout)
+			self.fifo_read(len , timeout)
 		}
 
 	}
@@ -491,24 +582,33 @@ impl Rfm69 {
 			unimplemented!();
 		} else {
 			self.recv_fixed(timeout)
-
 		}
 	}
 	fn set_mode_internal(&mut self, mode: Mode) -> Result<(), std::io::Error> {
-		if self.mode == mode {
+		let ret = if self.mode == mode {
 			Ok(())
 		} else if self.mode == Mode::Listen {
 			self.write(Register::OpMode, set_bit(mode as u8, 5))?;
 			self.write(Register::OpMode, mode as u8)
 		} else {
 			self.write(Register::OpMode, mode as u8)	
-		}
+		};
+		self.mode = mode;
+		ret
 	}
 	pub fn set_mode(&mut self, mode: Mode) -> Result<(), Error> {
 		self.set_mode_internal(mode)?;
 		// wait for mode to be set
 		let iw = self.get_mode_ready()?;
 		iw.check_and_wait(Duration::from_millis(10))
+	}
+	pub fn mode(&self) -> Mode {
+		self.mode
+	}
+	pub fn mode_dev(&self) -> Result<Mode, std::io::Error> {
+		let mode = self.read(Register::OpMode)? & 0x7F;
+		Ok(Mode::from_u8(mode).unwrap())
+
 	}
 }
 impl Drop for Rfm69 {
@@ -680,6 +780,11 @@ impl PacketConfig {
 		bit(self.0[0], 7)
 	}
 	#[inline]
+	pub fn set_variable(&mut self, val: bool) -> &mut Self {
+		self.0[0] = set_bit_to(self.0[0], 7, val);
+		self
+	}
+	#[inline]
 	pub fn is_fixed(&self) -> bool {
 		!self.is_variable() && self.len() != 0
 	}
@@ -692,8 +797,9 @@ impl PacketConfig {
 		self.0[1]
 	}
 	#[inline]
-	pub fn set_len(&mut self, len: u8) {
+	pub fn set_len(&mut self, len: u8) -> &mut Self {
 		self.0[1] = len;
+		self
 	}
 	#[inline]
 	pub fn aes(&self) -> bool {
@@ -710,6 +816,12 @@ impl PacketConfig {
 	#[inline]
 	pub fn threshold(&self) -> u8 {
 		(self.1[0] >> 1) & 0x7F
+	}
+	#[inline]
+	pub fn set_threshold(&mut self, threshold: u8) -> &mut Self {
+		assert!(threshold < 0x80);
+		self.1[0] = (self.1[0] & 0xF0) | threshold;
+		self
 	}
 	#[inline]
 	pub fn start(&self) -> bool {
@@ -779,7 +891,7 @@ impl Default for PacketConfig {
 	}
 }
 
-#[derive(PartialEq,Clone,Copy)]
+#[derive(FromPrimitive,PartialEq,Clone,Copy,Debug)]
 pub enum Mode {
 	Listen = 0x40,
 	Sleep = 0x00,
