@@ -5,6 +5,10 @@ authors = ["Curtis Maves <curtismaves@gmail.com>"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = ["hp-sleep"]
+
+hp-sleep = ["spin_sleep"]
 
 [dependencies]
 spidev = "0.4.0"
@@ -12,6 +16,10 @@ gpio-cdev = "0.2.0"
 nix = "0.17.0"
 num-traits = "0.2.0"
 num-derive = "0.3.0"
+spin_sleep = { version = "0.3.7", optional = true }
 
 [dev-dependencies]
 rand = "0.7"
+
+
+
