@@ -2,13 +2,12 @@
 
 use gpio_cdev::{Line,LineHandle,LineRequestFlags,EventRequestFlags,LineEventHandle};
 use spidev::{Spidev,SpidevTransfer,SpidevOptions,SpiModeFlags};
-use crate::{bit,cond_set_bit,set_bit,Error,set_bit_to};
+use crate::{bit,cond_set_bit,set_bit,Error,set_bit_to,sleep};
 use num_traits::FromPrimitive;
 use num_derive::FromPrimitive;
 use std::convert::TryInto;
 use std::os::unix::io::AsRawFd;
 use std::fmt;
-use std::thread::sleep;
 use std::time::{Instant,Duration};
 use std::convert::TryFrom;
 use nix::poll;

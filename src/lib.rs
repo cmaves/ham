@@ -1,4 +1,9 @@
 
+use std::thread;
+use std::time::Duration;
+
+#[cfg(feature = "hp-sleep")]
+use spin_sleep;
 
 pub mod rfm69;
 
@@ -24,6 +29,17 @@ impl From<std::io::Error> for Error {
 	fn from(v: std::io::Error) -> Self {
 		Error::IoError(v)
 	}
+}
+
+#[inline]
+fn sleep(dur: Duration) {
+	// a high persision sleep version
+	if cfg!(feature = "hp-sleep") {
+		spin_sleep::sleep(dur)
+	} else {
+		thread::sleep(dur)
+	}
+
 }
 
 #[inline]
