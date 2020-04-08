@@ -109,16 +109,14 @@ fn send_recv_variable() {
 	let sc = test_sync_config();
 	rfm1.set_sync(&sc).unwrap();
 	rfm2.set_sync(&sc).unwrap();
-	for i in &[8_u8, 16, 32, 64, 65, 66, 128, 255] {
+	for i in &[8_u8, 16, 32, 64, 65, 67, 128, 255] {
 	
 		msg.resize(*i as usize + 1, 0);
 		rng.try_fill(msg.as_mut_slice()).unwrap();
 		msg[0] = *i;
 		let copy = Vec::from(&msg[1..]);
-		eprintln!("msg to be send: {:?}", msg);
 		let recv = spawn(move || {
 			let recvd = rfm1.recv(Duration::from_secs(5)).unwrap();
-			eprintln!("variable message received: {}", i);
 			rfm1.set_mode(Mode::Standby).unwrap();
 			assert_eq!(recvd,copy);
 			rfm1
