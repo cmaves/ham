@@ -14,6 +14,7 @@ use std::convert::TryInto;
 use std::fmt;
 use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::{SyncSender,Receiver,sync_channel,channel};
+use std::sync::{Arc,RwLock};
 use std::thread::{JoinHandle,spawn};
 use std::time::{Instant,Duration};
 
@@ -184,10 +185,13 @@ impl Rfm69 {
 		if self.config() != self.config_dev()? { 
 			return Err(Error::ChipMalfunction("Stored packet config doesn't match device.".to_string())); 
 		}
+		if self.sync() != self.sync_dev()? {
+			return Err(Error::ChipMalfunction("Stored sync config doesn't match device.".to_string())); 
+		}
 		if self.bitrate() != self.bitrate_dev()? {
 			return Err(Error::ChipMalfunction("Stored bitrate doesn't match device.".to_string())); 
 		}
-		if self.preamble != self.preamble_len_dev()? {
+		if self.preamble_len() != self.preamble_len_dev()? {
 			return Err(Error::ChipMalfunction("Stored premable length doesn't match device.".to_string())); 
 		}
 		Ok(())
@@ -267,6 +271,7 @@ impl Rfm69 {
 		let v = (FXOSC as f64 / v as f64).round() as u32;
 		Ok(v)
 	}
+	#[inline]
 	pub fn bitrate(&self) -> u32 {
 		self.bitrate
 	}
@@ -348,12 +353,17 @@ impl Rfm69 {
 		let ret = (v as f64 * FSTEP).round() as u32;
 		Ok(ret)
 	}
-	pub fn set_sync<T: AsRef<SyncConfig>>(&self, config: T) -> Result<(), Error> {
+	pub fn set_sync<T: AsRef<SyncConfig>>(&mut self, config: T) -> Result<(), Error> {
 		let config = config.as_ref();
 		self.write_many(Register::SyncConfig, &config.0)?;
+		self.sc = *config;
 		Ok(())
 	}
-	pub fn sync(&self) -> Result<SyncConfig, std::io::Error> {
+	#[inline]
+	pub fn sync(&self) -> SyncConfig {
+		self.sc
+	}
+	pub fn sync_dev(&self) -> Result<SyncConfig, std::io::Error> {
 		let mut buf = [0; 9];
 		self.read_many(Register::SyncConfig, &mut buf)?;
 		Ok(SyncConfig(buf))
@@ -752,11 +762,12 @@ impl Drop for Rfm69 {
 pub struct Rfm69PR {
 	rfm_thread: JoinHandle<Result<Rfm69,(Error, Rfm69)>>,
 	conf_sender: SyncSender<ConfigMessage<[u8; 8], u8>>,
-	msg_recv: Receiver<Vec<u8>>
+	msg_recv: Receiver<Vec<u8>>,
+	clock: Arc<RwLock<(Instant, u32)>>
 }
 impl Rfm69PR {
 	fn terminate(mut self) -> Result<Rfm69, (Error, Option<Rfm69>)> {
-		self.conf_sender.send(ConfigMessage::Terminate).ok(); // ignore error
+		self.conf_sender.send(ConfigMessage::Terminate).is_ok(); // ignore error
 		self.rfm_thread.join().map_err(|_| {(Error::Unrecoverable("The receiver thread paniced!".to_string()), None)})?
 			.map_err(|e| { (e.0, Some(e.1)) })
 	}
@@ -769,7 +780,7 @@ fn config_net(netaddr: [u8; 8], rfm: &mut Rfm69) -> Result<(), Error> {
 	let mut pc = rfm.config();
 	if len != 0 {
 		sc.set_error(0);
-		sc.set_sync_size(len as u8);
+		sc.set_len(len as u8);
 		if pc.dc() != DCFree::Whitening { rfm.set_config(pc.set_dc(DCFree::Whitening))? }
 	} else if pc.dc() != DCFree::None {
 		rfm.set_config(pc.set_dc(DCFree::None))?;
@@ -805,7 +816,10 @@ impl IntoPacketReceiver for Rfm69 {
 		self.set_mode_internal(Mode::Standby)?;
 		let (conf_sender, conf_recv) = sync_channel(0);
 		let (msg_sender, msg_recv) = channel();
+		let clock = Arc::new(RwLock::new((Instant::now(), 0)));
+		let clock_clone = clock.clone();
 		let rfm_thread = spawn(move ||{ 
+			let clock = clock_clone;
 			let mut init_dev = ||{
 				let pc = *PacketConfig::default().set_variable(true).set_crc(false);
 				self.set_config(pc)?;
@@ -843,6 +857,7 @@ impl IntoPacketReceiver for Rfm69 {
 				} else {
 					let mut vec = vec![0; 255];
 					let res = self.recv(&mut vec, Duration::from_millis(1));
+					let now = Instant::now();
 					if let Err(e) = &res {
 						// handle error on 
 						let unrecoverable = match e {
@@ -868,13 +883,25 @@ impl IntoPacketReceiver for Rfm69 {
 						}
 					} else {
 						let size = res.unwrap();
+						let sc = self.sync();
+						let sync_len = (sc.on() as u8 * sc.len()) as u32;
+						let start = now.checked_sub(Duration::from_secs_f64(8.0 * (size as u32 + sync_len + self.preamble_len() as u32 + 1) as f64 / self.bitrate() as f64)).unwrap_or(now);
 						if size >= 16 {
 							vec.resize(size, 0);
 							if let Ok(buf) =  decoder.correct(&vec, None) {
-								vec.resize(size - 16, 0);
-								vec.copy_from_slice(buf.data());
+								let buf = buf.data();
+								let mut time = [0; 4];
+								time.copy_from_slice(&buf[0..4]);
+								let time = u32::from_be_bytes(time);
+								vec.resize(size - 20, 0);
+								vec.copy_from_slice(&buf[4..]);
 								if let Err(_) = msg_sender.send(vec) {
 									return Err((Error::Unrecoverable("Reader thread: Receiver Message is disconnected".to_string()), self));
+								}
+								if let Ok(mut lock) = clock.write() {
+									*lock = (start, time);
+								} else {
+									return Err((Error::Unrecoverable("Reader thread: Clock lock is poisoned!".to_string()), self));
 								}
 							}
 						}
@@ -882,14 +909,19 @@ impl IntoPacketReceiver for Rfm69 {
 				}
 			}
 		});
-		Ok(Rfm69PR{rfm_thread, conf_sender, msg_recv})
+		Ok(Rfm69PR{rfm_thread, conf_sender, msg_recv, clock})
 	}
 
 }
 
 impl PacketReceiver for Rfm69PR {
+	fn cur_time(&self) -> Result<u32, Error> {
+		let time = self.clock.read().map_err(|_| {Error::Unrecoverable("Packet receiver poisoned the clock lock!".to_string())})?;
+		let diff = Instant::now().duration_since(time.0).as_micros() as u32;
+		Ok(diff.wrapping_add(time.1))
+	}
 	fn recv_packet(&mut self) -> Result<Vec<u8>, Error> {
-		unimplemented!();
+		self.msg_recv.recv().map_err(|_| {Error::Unrecoverable("Packet receiver thread is disconnected!".to_string())})
 	}
 }
 impl NetworkPacketReceiver<&[u8]> for Rfm69PR {
@@ -1000,7 +1032,7 @@ pub enum Register {
     TestDagc = 0x6F,
 }
 
-#[derive(Debug,PartialEq)]
+#[derive(Debug,PartialEq,Clone,Copy)]
 pub struct SyncConfig([u8; 9]);
 impl AsRef<SyncConfig> for SyncConfig {
 	fn as_ref(&self) -> &SyncConfig {
@@ -1035,13 +1067,13 @@ impl SyncConfig {
 		self
 	}
 	#[inline]
-	pub fn set_sync_size(&mut self, size: u8) -> &mut Self {
+	pub fn set_len(&mut self, size: u8) -> &mut Self {
 		assert!(size >=1 && size <= 8);
 		self.0[0] = (self.0[0] & 0xC7) | ((size - 1) << 3);
 		self
 	}
 	#[inline]
-	pub fn sync_size(&self) -> u8 {
+	pub fn len(&self) -> u8 {
 		((self.0[0] >> 3) & 0x07) + 1
 	}
 	#[inline]

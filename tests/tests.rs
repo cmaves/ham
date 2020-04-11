@@ -1,5 +1,5 @@
 use gpio_cdev::Chip;
-use crate::rfm69::{PacketConfig,Rfm69,SyncConfig,Mode};
+use ham::rfm69::{PacketConfig,Rfm69,SyncConfig,Mode};
 use spidev::Spidev;
 use std::thread::{spawn,sleep};
 use std::time::Duration;
@@ -43,11 +43,12 @@ fn sync_word() {
 	let rst = chip.get_line(24).unwrap();
 	let en = chip.get_line(3).unwrap();
 	let spidev = Spidev::open("/dev/spidev0.0").unwrap();
-	let rfm69 = Rfm69::new(rst, en, spidev).unwrap();
+	let mut rfm69 = Rfm69::new(rst, en, spidev).unwrap();
 	let sc = test_sync_config();
 	rfm69.set_sync(&sc).unwrap();
-	let ret = rfm69.sync().unwrap();
+	let ret = rfm69.sync_dev().unwrap();
 	assert_eq!(sc, ret);
+	assert_eq!(sc, rfm69.sync());
 }
 #[test]
 fn send_recv_fixed() {
@@ -199,3 +200,4 @@ fn power() {
 	assert_eq!(rfm.power().unwrap(), 13);
 	rfm.validate_dev().unwrap();
 }
+

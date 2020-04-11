@@ -7,8 +7,6 @@ use spin_sleep;
 
 pub mod rfm69;
 
-#[cfg(test)]
-pub mod tests;
 
 #[derive(Debug)]
 pub enum Error {
@@ -68,6 +66,7 @@ fn set_bit_to(byte: u8, bit: u8, val: bool) -> u8 {
 
 
 trait PacketReceiver {
+	fn cur_time(&self) -> Result<u32, Error>;
 	fn recv_packet(&mut self) -> Result<Vec<u8>, Error>;
 }
 trait IntoPacketReceiver {
