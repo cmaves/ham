@@ -1,16 +1,22 @@
 
+use crate::{bit,cond_set_bit,set_bit,Error,set_bit_to,sleep,unset_bit,ConfigMessage,Void};
+use crate::{PacketReceiver,NetworkPacketReceiver,AddressPacketReceiver,BroadcastPacketReceiver};
+use crate::{IntoPacketReceiver};
 
 use gpio_cdev::{Line,LineHandle,LineRequestFlags,EventRequestFlags,LineEventHandle};
-use spidev::{Spidev,SpidevTransfer,SpidevOptions,SpiModeFlags};
-use crate::{bit,cond_set_bit,set_bit,Error,set_bit_to,sleep};
-use num_traits::FromPrimitive;
-use num_derive::FromPrimitive;
-use std::convert::TryInto;
-use std::os::unix::io::AsRawFd;
-use std::fmt;
-use std::time::{Instant,Duration};
-use std::convert::TryFrom;
 use nix::poll;
+use num_derive::FromPrimitive;
+use num_traits::FromPrimitive;
+use reed_solomon::Decoder;
+use spidev::{Spidev,SpidevTransfer,SpidevOptions,SpiModeFlags};
+use std::convert::TryFrom;
+use std::convert::TryInto;
+use std::fmt;
+use std::os::unix::io::AsRawFd;
+use std::sync::mpsc::{SyncSender,Receiver,sync_channel,channel};
+use std::thread::{JoinHandle,spawn};
+use std::time::{Instant,Duration};
+
 
 pub struct Rfm69 {
 	rst: LineHandle,
@@ -24,7 +30,7 @@ pub struct Rfm69 {
 	dio_maps: [u8; 6],
 	fifo_thresh: u8,
 	bitrate: u32,
-	preamble: u16
+	preamble: u16,
 }
 struct IrqWait<'a> {
 	line: Option<LineEventHandle>,
@@ -121,21 +127,30 @@ impl Rfm69 {
 		spi.configure(&options)?;
 
 		let dios = [None, None, None, None, None, None];
-		let mut rfm = Rfm69 { spi, rst, en, dios, verbose: false, bitrate: 4800, preamble: 0x03,
-			pc: PacketConfig::default(), mode: Mode::Standby, dio_maps: [0; 6] , fifo_thresh: 15,
-			sc: SyncConfig::default()};
-		rfm.validate_version()?;
-		rfm.configure_defaults()?;
+		let mut rfm = Rfm69 { spi, rst, en, dios, verbose: false, bitrate: 4800, preamble: 0x03, 
+			pc: PacketConfig::default(), mode: Mode::Standby, dio_maps: [0; 6] , fifo_thresh: 15, 
+			sc: SyncConfig::default()
+		};
+		(||{
+			rfm.validate_version()?;
+			rfm.configure_defaults()?;
+			rfm.get_mode_ready()?.check_and_wait(Duration::from_millis(10))?;
+			rfm.validate_dev()
+		})().map_err(|e| Error::Init(format!("Device failed to init!: {:?}", e)))?;
 		Ok(rfm)
 	}
 	pub fn set_preamble_len(&mut self, len: u16) -> Result<(), Error> {
-		unimplemented!();
+		self.write_many(Register::PreambleMsb, &len.to_be_bytes())?;
+		self.preamble = len;
+		Ok(())
 	}
 	pub fn preamble_len(&self) -> u16 {
 		self.preamble
 	}
 	pub fn preamble_len_dev(&self) -> Result<u16, Error> {
-		unimplemented!();
+		let mut len = [0; 2];
+		self.read_many(Register::PreambleMsb, &mut len)?;
+		Ok(u16::from_be_bytes(len))
 	}
 	pub fn get_version(&self) -> Result<u8,std::io::Error> {
 		self.read(Register::Version)
@@ -153,18 +168,39 @@ impl Rfm69 {
 		self.bitrate = 4800;
 		self.fifo_thresh = 15;
 		self.validate_version()?;
-		self.configure_defaults()?;
+		self.get_mode_ready()?.check_and_wait(Duration::from_millis(10))?;
+		// TODO: implement the reset values
+		unimplemented!();
 		Ok(self)
+	}
+	pub fn validate_dev(&self) -> Result<(), Error> {
+		self.validate_version()?;
+		self.power()?;
+		let mode_dev = self.mode_dev()?;
+		if self.mode != mode_dev {
+			let err_str = format!("Stored mode doesn't match device!: {:?} (dev) != {:?}", mode_dev, self.mode);
+			return Err(Error::ChipMalfunction(err_str));
+		}
+		if self.config() != self.config_dev()? { 
+			return Err(Error::ChipMalfunction("Stored packet config doesn't match device.".to_string())); 
+		}
+		if self.bitrate() != self.bitrate_dev()? {
+			return Err(Error::ChipMalfunction("Stored bitrate doesn't match device.".to_string())); 
+		}
+		if self.preamble != self.preamble_len_dev()? {
+			return Err(Error::ChipMalfunction("Stored premable length doesn't match device.".to_string())); 
+		}
+		Ok(())
 	}
 	fn validate_version(&self) -> Result<(), Error> {
 		let version = self.get_version()?;
 		if version == 0x24 {
 			Ok(())
 		} else {
-			Err(Error::InitError(format!("Version mismatch! expected 0x24, found {:#X}", version)))
+			Err(Error::ChipMalfunction(format!("Version mismatch! expected 0x24, found {:#X}", version)))
 		}
 	}
-	fn read(&self, reg: Register) -> Result<u8, std::io::Error> {
+	pub fn read(&self, reg: Register) -> Result<u8, std::io::Error> {
 		let mut buf = [0];
 		self.read_many(reg, &mut buf)?;
 		Ok(buf[0])
@@ -177,6 +213,20 @@ impl Rfm69 {
 		self.spi.transfer_multiple(&mut xfers)
 		
 	}
+	fn read_many_count(&self, reg: Register, buf: &mut [u8], count: u8) -> Result<(), Error> {
+		let count = count as usize;
+		let reg = [(reg as u8) & 0x7F];
+		let mut local = [0; 255];
+		let i_buf = &mut local[..count - buf.len()];
+
+		let addr_xfer =  SpidevTransfer::write(&reg);
+		let buf = if count >= buf.len() { buf } else { &mut buf[..count] };
+		let read_xfer = SpidevTransfer::read(buf);
+		let buf_xfer = SpidevTransfer::read(i_buf);
+		let mut xfers = [addr_xfer, read_xfer, buf_xfer];
+		self.spi.transfer_multiple(&mut xfers)?;
+		if i_buf.len() != 0 { Err(Error::BufferOverflow(count)) } else { Ok(()) }
+	}
 	fn write(&self, reg: Register, val: u8) -> Result<(), std::io::Error> {
 		let buf = [val];
 		self.write_many(reg, &buf)
@@ -187,6 +237,10 @@ impl Rfm69 {
 		let write_xfer = SpidevTransfer::write(buf);
 		let mut xfers = [addr_xfer, write_xfer];
 		self.spi.transfer_multiple(&mut xfers)
+	}
+	pub fn rssi(&self) -> Result<f32, std::io::Error> {
+		Ok(self.read(Register::RssiValue)? as f32 / -2.0)
+
 	}
 	pub fn aes(&self, key: &[u8; 16]) -> Result<(), std::io::Error> {
 		self.write_many(Register::AesKey1, key)
@@ -206,7 +260,7 @@ impl Rfm69 {
 			Err(Error::BadInputs("Bitrate out of bounds!".to_string()))
 		}
 	}
-	pub fn bitrate_dev(&self) -> Result<u32, Error> {
+	pub fn bitrate_dev(&self) -> Result<u32, std::io::Error> {
 		let mut v = [0, 0];	
 		self.read_many(Register::BitrateMsb, &mut v)?;
 		let v = u16::from_be_bytes(v);
@@ -215,6 +269,64 @@ impl Rfm69 {
 	}
 	pub fn bitrate(&self) -> u32 {
 		self.bitrate
+	}
+	pub fn set_power(&self, power: i8) -> Result<(), Error> {
+		if power < -18 || power > 20 {
+			return Err(Error::BadInputs(format!("power must be [-18,20] dBm, ({})", power)));
+		}
+		if power <= 13 { // set power 
+			self.write_many(Register::TestPa1, &[0x55, 0x40, 0x70])?;
+			self.write(Register::Ocp, 0x1A)?; // set Over current protection to 95 mA
+			let power = (power - (-18)) as u8;
+			self.write(Register::PaLevel, 0x80 | power)?;
+		} else if power <= 17 {
+			self.write_many(Register::TestPa1, &[0x55, 0x40, 0x70])?;
+			self.write(Register::Ocp, 0x1F)?; // set Over current protection to 120 mA
+			let power = (power - (-14)) as u8;
+			self.write(Register::PaLevel, 0x60 | power)?;
+		} else {
+			self.write(Register::Ocp, 0x0F)?; // disable Over current protection
+			self.write_many(Register::TestPa1, &[0x5D, 0x40, 0x7C])?; // high power mode
+			let power = (power - (-11)) as u8;
+			self.write(Register::PaLevel, 0x60 | power)?;
+		}
+		Ok(())
+	}
+	pub fn power(&self) -> Result<i8, Error> {
+		// get the pa register
+		let palevel = self.read(Register::PaLevel)?;
+		// pa[012] are stored in bits 7, 6 & 5
+		let pa012 = (palevel >> 5) & 0x07;
+		if pa012 > 4 || pa012 < 2 { 
+			// the only valid values are pa0 on, pa1 on, or, pa1 & pa2 on
+			return Err(Error::ChipMalfunction(format!("Power amplifiers are in unknown state. RegPaLevel: {}", palevel)));
+		}
+
+		// the level is stored as an offset [0,31] stored in bits 4-0
+		let palevel = palevel & 0x1F;
+		if pa012 != 4 && palevel < 16 {
+			return Err(Error::ChipMalfunction("Power levels must be at least 16 when PA0 is not in use".to_string()));
+		}
+		let mut testpa = [0, 0, 0]; // middle byte is unused
+		self.read_many(Register::TestPa1, &mut testpa)?;
+		let shift = if testpa[0] == 0x55 && testpa[2] == 0x70 {
+			match pa012 {
+				2|4 => -18,
+				3 => -14,
+				_ => unreachable!()
+			}
+		} else if testpa[0] == 0x5D && testpa[2] == 0x7C {
+			if pa012 != 0x03 { 
+				/* TODO: evaluate whether this should be pa012 == 0x04; 
+					in other words is PA1 + !PA2 + HP valid
+				 */
+				return Err(Error::ChipMalfunction("High power mode is enabled when PA1 and PA2 are not both enabled.".to_string()));
+			}
+			-11
+		} else {
+			return Err(Error::ChipMalfunction(format!("High power mode registers are in invalid state. RegTestPa[12] {:#04X} {:#04X}.", testpa[0], testpa[2])));
+		};
+		Ok(shift + palevel as i8)
 	}
 	pub fn set_frequency(&self, frequency: u32) -> Result<(), Error> {
 		if frequency < MIN_FREQ {
@@ -236,15 +348,15 @@ impl Rfm69 {
 		let ret = (v as f64 * FSTEP).round() as u32;
 		Ok(ret)
 	}
-	pub fn set_sync(&self, config: &SyncConfig) -> Result<(), Error> {
-		let v: [u8; 9] = config.try_into()?;
-		self.write_many(Register::SyncConfig, &v)?;
+	pub fn set_sync<T: AsRef<SyncConfig>>(&self, config: T) -> Result<(), Error> {
+		let config = config.as_ref();
+		self.write_many(Register::SyncConfig, &config.0)?;
 		Ok(())
 	}
 	pub fn sync(&self) -> Result<SyncConfig, std::io::Error> {
 		let mut buf = [0; 9];
 		self.read_many(Register::SyncConfig, &mut buf)?;
-		Ok((&buf).into())
+		Ok(SyncConfig(buf))
 	}
 	pub fn temp(&self) -> Result<i8, Error> {
 		self.write(Register::Temp1, 0x08)?;
@@ -407,7 +519,7 @@ impl Rfm69 {
 	fn fifo_write(&self, buf: &[u8]) -> Result<(), Error> {
 		// write inits bytes to fifo
 		let mut sent = 0;
-		let first = usize::min(buf.len(), 66);
+		let first = buf.len().min(66);
 		self.write_many(Register::Fifo, &buf[0..first])?;
 		sent += first;
 		// ensure mode is ready before writing more
@@ -438,7 +550,7 @@ impl Rfm69 {
 		if payload.len() > 256 {
 			return Err(Error::BadInputs(format!("Buffer length ({}) cannot be greater than 255!", payload.len())));
 		} else if self.pc.aes() {
-			if self.pc.filtering() != 0 {
+			if self.pc.filtering() != Filtering::None {
 				if payload.len() > 50 {
 					return Err(Error::BadInputs("When AES is enabled with filterin, payload length must be less than 51".to_string()));
 				}
@@ -468,10 +580,10 @@ impl Rfm69 {
 		let send_timeout = Duration::from_secs_f64((273.0 + self.preamble as f64) * 8.0 / self.bitrate as f64);
 		self.get_packet_sent()?.check_and_wait(send_timeout)
 	}
-	fn fifo_read(&self, count: usize, timeout: Duration) -> Result<Vec<u8>, Error> {
+	fn fifo_read(&self, buf: &mut [u8], count: u8, timeout: Duration) -> Result<(), Error> {
+		let count = count as usize;
 		#[cfg(test)]
 		eprintln!("fifo_read(): {}", count);
-		let mut ret = Vec::with_capacity(count);
 		// wait for the byte to be received
 		let fifo = self.get_fifo_not_empty()?;
 		fifo.check_and_wait(timeout)?;
@@ -487,7 +599,8 @@ impl Rfm69 {
 					return Err(e);
 				}
 			}
-			ret.push(self.read(Register::Fifo)?);
+			let b  = self.read(Register::Fifo)?;
+			if i < buf.len() { buf[i] = b; }
 		}
 		// at this point either CrcOk or PayloadReady should fire
 		let ready = self.get_payload_crc()?;
@@ -504,21 +617,24 @@ impl Rfm69 {
 			};
 			let bad_fifo = if !self.pc.clear()  {
 				//if clear is not set we should get the bad payload 
-				ret.push(self.read(Register::Fifo)?);
-				Some(ret)
+				let b = self.read(Register::Fifo)?;
+				if count - 1 < buf.len() { buf[count - 1] = b; }
+				Some(count as usize)
 			} else { None };
 			Err(Error::BadMessage(s, bad_fifo))
 		} else { 
-			ret.push(self.read(Register::Fifo)?);
-			Ok(ret)	
+			let b = self.read(Register::Fifo)?;
+			if count <= buf.len() { buf[count - 1] = b; }
+			// check if we have overflowed the buffer 
+			if count > buf.len() { Err(Error::BufferOverflow(count as usize)) } else { Ok(()) }
 		}
 	
 	}
-	fn fifo_read_no_check(&self, count: usize, timeout: Duration) -> Result<Vec<u8>, Error> {
-		let mut ret = vec![0; count];
+	fn fifo_read_no_check(&self, buf: &mut [u8], count: u8, timeout: Duration) -> Result<(), Error> {
+		assert!(count <= 66);
 		let irq = self.get_payload_crc()?;
 		if let Err(e) = irq.check_and_wait(timeout) {
-			if self.sc.on || self.pc.filtering() != 0 {
+			if self.sc.on() || self.pc.filtering() != Filtering::None {
 				if !IrqWait::check_flag(&self, Irq::SyncAddressMatch)? {
 					// the sync and address never seen, normal timeout
 					return Err(e);
@@ -541,59 +657,66 @@ impl Rfm69 {
 			let s = "A CRC Error occured!".to_string();
 			let bad_fifo = if !self.pc.clear() {
 				// if clear is not set we should get bad payload for error message
-				self.read_many(Register::Fifo, &mut ret[..])?;
-				Some(ret)
+				if let Err(e) = self.read_many_count(Register::Fifo, buf, count) {
+					// if the message was bad the we ignore the BufferOverflow Error
+					if let Error::BufferOverflow(_) = e  { Some(count as usize) } else { return Err(e) }
+				} else {
+					Some(count as usize)
+				}
 			} else { None };
 			Err(Error::BadMessage(s, bad_fifo))
 		} else {
-			self.read_many(Register::Fifo, &mut ret)?;
-			Ok(ret)
+			self.read_many_count(Register::Fifo, buf, count)
 		}
 	}
-	fn recv_fixed(&self, timeout: Duration) -> Result<Vec<u8>, Error> {
-		let len = self.pc.len() as usize;
+	fn recv_fixed(&self, buf: &mut [u8], timeout: Duration) -> Result<usize, Error> {
+		let len = self.pc.len();
+		let ret = if len as usize  > buf.len() { buf.len() } else { len as usize };
 		if len <= 66 {
 			// short messages can be read in one go
 			eprintln!("Doing fixed_recv() short message");
-			self.fifo_read_no_check(len, timeout)
+			self.fifo_read_no_check(buf, len, timeout).map(|_| ret)
 		} else {
 			// long messages are required to be read continously
-			self.fifo_read(len as usize, timeout)
+			self.fifo_read(buf, len, timeout).map(|_| ret)
 		}
 	}
-	fn recv_variable(&self, timeout: Duration) -> Result<Vec<u8>, Error> {
+	fn recv_variable(&self, buf: &mut [u8], timeout: Duration) -> Result<usize, Error> {
 		let irq = self.get_fifo_not_empty()?;
 		irq.check_and_wait(timeout)?;
-		let len = self.read(Register::Fifo)? as usize;
+		let len = self.read(Register::Fifo)?;
+		let ret = len as usize;
 		if len <= 66 {
 			eprintln!("Doing variable_recv() short message {}", len);
-			self.fifo_read_no_check(len, timeout)
+			self.fifo_read_no_check(buf, len, timeout).map(|_| ret)
 		} else {
-			self.fifo_read(len , timeout)
+			self.fifo_read(buf, len , timeout).map(|_| ret)
 		}
 
 	}
-	pub fn recv(&mut self, timeout: Duration) -> Result<Vec<u8>,Error> {
+	pub fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize,Error> {
 		self.set_mode(Mode::Rx)?;
 		if self.pc.is_variable() {
-			self.recv_variable(timeout)
+			self.recv_variable(buf, timeout)
 		} else if self.pc.is_unlimited() {
 			unimplemented!();
 		} else {
-			self.recv_fixed(timeout)
+			self.recv_fixed(buf, timeout)
 		}
 	}
-	fn set_mode_internal(&mut self, mode: Mode) -> Result<(), std::io::Error> {
-		let ret = if self.mode == mode {
-			Ok(())
-		} else if self.mode == Mode::Listen {
+	fn set_mode_internal(&mut self, mode: Mode) -> Result<(), Error> {
+		if self.mode == mode {
+			return Ok(());
+		} 
+		if self.mode == Mode::Listen {
 			self.write(Register::OpMode, set_bit(mode as u8, 5))?;
-			self.write(Register::OpMode, mode as u8)
-		} else {
-			self.write(Register::OpMode, mode as u8)	
-		};
+		}
+		self.write(Register::OpMode, mode as u8)?;
+		if mode == Mode::Rx { 
+			self.set_power(13)?; 
+		}
 		self.mode = mode;
-		ret
+		Ok(())
 	}
 	pub fn set_mode(&mut self, mode: Mode) -> Result<(), Error> {
 		self.set_mode_internal(mode)?;
@@ -601,6 +724,7 @@ impl Rfm69 {
 		let iw = self.get_mode_ready()?;
 		iw.check_and_wait(Duration::from_millis(10))
 	}
+ 	#[inline]
 	pub fn mode(&self) -> Mode {
 		self.mode
 	}
@@ -624,6 +748,169 @@ impl Drop for Rfm69 {
 		}
 	}
 }
+
+pub struct Rfm69PR {
+	rfm_thread: JoinHandle<Result<Rfm69,(Error, Rfm69)>>,
+	conf_sender: SyncSender<ConfigMessage<[u8; 8], u8>>,
+	msg_recv: Receiver<Vec<u8>>
+}
+impl Rfm69PR {
+	fn terminate(mut self) -> Result<Rfm69, (Error, Option<Rfm69>)> {
+		self.conf_sender.send(ConfigMessage::Terminate).ok(); // ignore error
+		self.rfm_thread.join().map_err(|_| {(Error::Unrecoverable("The receiver thread paniced!".to_string()), None)})?
+			.map_err(|e| { (e.0, Some(e.1)) })
+	}
+}
+fn config_net(netaddr: [u8; 8], rfm: &mut Rfm69) -> Result<(), Error> {
+	let mut sc = SyncConfig::default();
+	let len = netaddr.iter().position(|x| *x == 0x00).unwrap_or(8);
+	sc.set_sync_word(&netaddr[..len]);
+	sc.set_on(len != 0);
+	let mut pc = rfm.config();
+	if len != 0 {
+		sc.set_error(0);
+		sc.set_sync_size(len as u8);
+		if pc.dc() != DCFree::Whitening { rfm.set_config(pc.set_dc(DCFree::Whitening))? }
+	} else if pc.dc() != DCFree::None {
+		rfm.set_config(pc.set_dc(DCFree::None))?;
+	}
+	rfm.set_sync(sc)
+}
+fn config_addr(addr: u8, rfm: &mut Rfm69) -> Result<(), Error> {
+	let mut pc = *(rfm.config().set_address(addr));
+	if addr == 0 {
+		pc.set_filtering(Filtering::None);		
+	} else if pc.broadcast() == 0 {
+		pc.set_filtering(Filtering::Address);
+	} else {
+		pc.set_filtering(Filtering::Both);
+	}
+	if pc != rfm.config() { rfm.set_config(pc) } else { Ok(()) }
+}
+fn config_broad(addr: u8, rfm: &mut Rfm69) -> Result<(), Error> { 
+	let mut pc = *(rfm.config().set_broadcast(addr));
+	if addr == 0 {
+		pc.set_filtering(Filtering::None);		
+	} else if pc.broadcast() == 0 {
+		pc.set_filtering(Filtering::Address);
+	} else {
+		pc.set_filtering(Filtering::Both);
+	}
+	if pc != rfm.config() { rfm.set_config(pc) } else { Ok(()) }
+}
+
+impl IntoPacketReceiver for Rfm69 {
+	type Recv = Rfm69PR;
+	fn into_packet_receiver(mut self) -> Result<Self::Recv, Error> {
+		self.set_mode_internal(Mode::Standby)?;
+		let (conf_sender, conf_recv) = sync_channel(0);
+		let (msg_sender, msg_recv) = channel();
+		let rfm_thread = spawn(move ||{ 
+			let mut init_dev = ||{
+				let pc = *PacketConfig::default().set_variable(true).set_crc(false);
+				self.set_config(pc)?;
+				self.get_mode_ready()?.check_and_wait(Duration::from_millis(10))?;
+				self.set_mode(Mode::Rx)
+			};
+			// configure Rfm69 device for receiving and catch error
+			if let Err(e) = init_dev() {
+				return Err((Error::Init(format!("Reader configuration failed: {:?}", e)), self));
+			}
+			let mut paused = true;
+			let decoder = Decoder::new(16);
+			loop {
+				// allocate space for the message
+				if paused {
+					loop {
+						if let Ok(v) = conf_recv.recv() {
+							if let Err(e) = match v {
+								// TODO: is thre some way to eliminate the duplicate code on lines 816
+								ConfigMessage::SetNetwork(netaddr) => config_net(netaddr, &mut self),
+								ConfigMessage::SetAddr(addr) => config_addr(addr, &mut self),
+								ConfigMessage::SetBroadcast(addr) => config_broad(addr, &mut self),
+								ConfigMessage::Terminate => return Ok(self),
+								ConfigMessage::Start => {paused = false; break;},
+								ConfigMessage::Pause => Ok(()),
+							} 
+							{
+								return Err((Error::Unrecoverable(format!("Reader thread: Device could not be configured!: {:?}", e)), self));
+							}
+						} else {
+							return Err((Error::Unrecoverable("Reader thread: Receiver is paused and conf_recv is disconnected".to_string()), self));
+						
+						}
+					}
+				} else {
+					let mut vec = vec![0; 255];
+					let res = self.recv(&mut vec, Duration::from_millis(1));
+					if let Err(e) = &res {
+						// handle error on 
+						let unrecoverable = match e {
+							Error::BadMessage(_,_)|Error::Timeout(_) => false, 
+							_ => true
+						};
+						if unrecoverable {
+							return Err((Error::Unrecoverable(format!("Receive thread: unrecoverable error occurred when receiving: {:?}", e)), self));
+						}
+					}
+					let cfg_msg = conf_recv.try_recv().ok();
+					if let Some(v) = cfg_msg {
+						if let Err(e) = match v {
+							ConfigMessage::SetNetwork(netaddr) => config_net(netaddr, &mut self),
+							ConfigMessage::SetAddr(addr) => config_addr(addr, &mut self),
+							ConfigMessage::SetBroadcast(addr) => config_broad(addr, &mut self),
+							ConfigMessage::Terminate => return Ok(self),
+							ConfigMessage::Start => {paused = false; Ok(())},
+							ConfigMessage::Pause => Ok(()),
+						} 
+						{
+								return Err((Error::Unrecoverable(format!("Reader thread: Device could not be configured!: {:?}", e)), self));
+						}
+					} else {
+						let size = res.unwrap();
+						if size >= 16 {
+							vec.resize(size, 0);
+							if let Ok(buf) =  decoder.correct(&vec, None) {
+								vec.resize(size - 16, 0);
+								vec.copy_from_slice(buf.data());
+								if let Err(_) = msg_sender.send(vec) {
+									return Err((Error::Unrecoverable("Reader thread: Receiver Message is disconnected".to_string()), self));
+								}
+							}
+						}
+					}
+				}
+			}
+		});
+		Ok(Rfm69PR{rfm_thread, conf_sender, msg_recv})
+	}
+
+}
+
+impl PacketReceiver for Rfm69PR {
+	fn recv_packet(&mut self) -> Result<Vec<u8>, Error> {
+		unimplemented!();
+	}
+}
+impl NetworkPacketReceiver<&[u8]> for Rfm69PR {
+	fn set_network(&mut self, netaddr: &[u8]) -> Result<(), Error> {
+		assert!(netaddr.len() <= 8);
+		let mut msg = [0;8];
+		msg[..netaddr.len()].copy_from_slice(&netaddr[..netaddr.len()]);
+		self.conf_sender.send(ConfigMessage::SetNetwork(msg)).map_err(|_| Error::Unrecoverable("Packet receiver thread is disconnected.".to_string()))
+	}
+}
+impl AddressPacketReceiver<&[u8],u8> for Rfm69PR {
+	fn set_addr(&mut self, addr: u8) -> Result<(), Error> {
+		self.conf_sender.send(ConfigMessage::SetAddr(addr)).map_err(|_| Error::Unrecoverable("Packet receiver thread is disconnected.".to_string()))
+	}
+}
+impl BroadcastPacketReceiver<&[u8], u8> for Rfm69PR {
+	fn set_broadcast(&mut self, addr: u8) -> Result<(), Error> {
+		self.conf_sender.send(ConfigMessage::SetBroadcast(addr)).map_err(|_| Error::Unrecoverable("Packet receiver thread is disconnected.".to_string()))
+	}
+}
+
 
 #[derive(FromPrimitive,Clone,Copy,Debug)]
 pub enum Register {
@@ -714,60 +1001,78 @@ pub enum Register {
 }
 
 #[derive(Debug,PartialEq)]
-pub struct SyncConfig {
-	pub syncword: [u8; 8],
-	pub len: u8,
-	pub diff: u8,
-	pub condition: bool,
-	pub on: bool
-}
-impl From<&[u8; 9]> for SyncConfig {
-	fn from(bytes: &[u8; 9]) -> Self {
-		eprintln!("making sync config from {:?}", bytes);
-		let mut ret = SyncConfig::default();
-		ret.on = bit(bytes[0], 7);
-		ret.condition = bit(bytes[0], 6);
-		ret.len = ((bytes[0] >> 3) & 0x07) + 1;
-		ret.diff = bytes[0] & 0x07;
-		for (i, v) in bytes[1..9].iter().enumerate() {
-			ret.syncword[i] = *v;	
-		}
-		ret
+pub struct SyncConfig([u8; 9]);
+impl AsRef<SyncConfig> for SyncConfig {
+	fn as_ref(&self) -> &SyncConfig {
+		self
 	}
 }
-impl TryFrom<&SyncConfig> for [u8; 9] {
-	type Error = Error;
-	fn try_from(sc: &SyncConfig) -> Result<Self, Self::Error> {
-		let mut ret = [0; 9];
-		ret[0] = cond_set_bit(ret[0], 7, sc.on);
-		ret[0] = cond_set_bit(ret[0], 6, sc.condition);
-		if sc.len > 8  || sc.len == 0 {
-			return Err(Error::BadInputs("Length must be [1,8].".to_string()));
-		}
-		ret[0] |= (sc.len - 1) << 3;
-		if sc.diff > 7 {
-			return Err(Error::BadInputs("Diff must be less than 8.".to_string()));
-		}
-		ret[0] |= sc.diff;
-		for (i, v) in sc.syncword.iter().enumerate() {
-			ret[i + 1] = *v;
-		}
-		eprintln!("made bytes from syncconfig: {:?}", ret);
-		Ok(ret)
-	}
-}
-
 
 impl Default for SyncConfig {
 	fn default() -> Self {
-		SyncConfig { 
-			syncword: [1; 8], 
-			len:  4,
-			diff: 0,
-			condition: false,
-			on: true
-		}
+		let mut buf = [0x01; 9];
+		buf[0] = 0x98;
+		SyncConfig(buf)
 	}
+}
+impl SyncConfig {
+	#[inline]
+	pub fn on(&self) -> bool {
+		bit(self.0[0], 7)
+	}
+	#[inline]
+	pub fn set_on(&mut self, val: bool) -> &mut Self {
+		self.0[0] = set_bit_to(self.0[0], 7, val);
+		self
+	}
+	#[inline]
+	pub fn fill(&self) -> bool {
+		bit(self.0[0], 6)
+	}
+	#[inline]
+	pub fn set_fill(&mut self, val: bool) -> &mut Self {
+		self.0[0] = set_bit_to(self.0[0], 6, val);
+		self
+	}
+	#[inline]
+	pub fn set_sync_size(&mut self, size: u8) -> &mut Self {
+		assert!(size >=1 && size <= 8);
+		self.0[0] = (self.0[0] & 0xC7) | ((size - 1) << 3);
+		self
+	}
+	#[inline]
+	pub fn sync_size(&self) -> u8 {
+		((self.0[0] >> 3) & 0x07) + 1
+	}
+	#[inline]
+	pub fn sync_word(&self) -> [u8; 8] {
+		let mut ret = [0; 8];
+		ret.copy_from_slice(&self.0[1..9]);
+		ret
+	}
+	#[inline]
+	pub fn set_sync_word(&mut self, word: &[u8]) -> &mut Self {
+		assert!(word.len() <= 8);
+		assert!(word.iter().position(|x| *x == 0x00) == None);
+		for (i, v) in word.iter().enumerate() {
+			self.0[i + 1] = *v;
+		}
+		for i in word.len()..8 {
+			self.0[i + 1] = 0x01;
+		}
+		self
+	}
+	#[inline]
+	pub fn error(&self) -> u8 {
+		self.0[0] & 0x07
+	}
+	#[inline]
+	pub fn set_error(&mut self, error: u8) -> &mut Self {
+		assert!(error < 8);
+		self.0[0] = (self.0[0] & 0xF8) | error;
+		self
+	}
+
 }
 
 #[derive(Clone,Copy,PartialEq,Debug)]
@@ -781,6 +1086,12 @@ impl PacketConfig {
 	#[inline]
 	pub fn set_variable(&mut self, val: bool) -> &mut Self {
 		self.0[0] = set_bit_to(self.0[0], 7, val);
+		self
+	}
+	#[inline]
+	pub fn set_unlimited(&mut self) -> &mut Self {
+		self.0[0] = unset_bit(self.0[0], 7);
+		self.0[1] = 1;
 		self
 	}
 	#[inline]
@@ -827,8 +1138,14 @@ impl PacketConfig {
 		bit(self.1[0], 7)
 	}
 	#[inline]
-	pub fn filtering(&self) -> u8 {
-		(self.0[0] >> 1) & 0x03
+	pub fn filtering(&self) -> Filtering {
+		Filtering::from_u8((self.0[0] >> 1) & 0x03).unwrap()
+	}
+	#[inline]
+	pub fn set_filtering(&mut self, filtering: Filtering) -> &mut Self { 
+		assert_ne!(filtering, Filtering::Reserved);
+		self.0[0] = (self.0[0] & 0xF9) | ((filtering as u8) << 1);
+		self
 	}
 	#[inline]
 	pub fn clear(&self) -> bool {
@@ -839,8 +1156,37 @@ impl PacketConfig {
 		bit(self.0[0], 4)
 	}
 	#[inline]
-	pub fn dc(&self) -> u8 {
-		(self.0[0] >> 5) & 0x03
+	pub fn set_crc(&mut self, val: bool) -> &mut Self {
+		self.0[0] = set_bit_to(self.0[0], 4, val);
+		self
+	}
+	#[inline]
+	pub fn dc(&self) -> DCFree {
+		DCFree::from_u8((self.0[0] >> 5) & 0x03).unwrap()
+	}
+	#[inline]
+	pub fn set_dc(&mut self, dc: DCFree) -> &mut Self {
+		assert_ne!(dc, DCFree::Reserved);
+		self.0[0] = (self.0[0] & 0x9F) | ((dc as u8) << 5);
+		self
+	}
+	#[inline]
+	pub fn address(&self) -> u8 {
+		self.0[2]
+	}
+	#[inline]
+	pub fn set_address(&mut self, addr: u8) -> &mut Self {
+		self.0[2] = addr;
+		self
+	}
+	#[inline]
+	pub fn broadcast(&self) -> u8 {
+		self.0[3]
+	}
+	#[inline]
+	pub fn set_broadcast(&mut self, addr: u8) -> &mut Self {
+		self.0[3] = addr;
+		self
 	}
 	pub fn validate(&self) -> Result<(), Error> {
 		if self.aes() { // perform aes validations
@@ -849,7 +1195,7 @@ impl PacketConfig {
 				return Err(Error::BadInputs("AES and unlimited packet size are incompatiable.".to_string()));
 			}
 			if self.is_fixed() {
-				if self.filtering() != 1 {
+				if self.filtering() != Filtering::None {
 					if  self.len() >= 66 {
 						return Err(Error::BadInputs("In fixed mode, when AES is enabled and filtering enabled, length must be less than 66".to_string()));
 					}
@@ -860,6 +1206,12 @@ impl PacketConfig {
 					}
 				}
 			}
+		}
+		if self.dc() == DCFree::Reserved {
+			return Err(Error::BadInputs("DC cannot be set to Reserved variant".to_string()))
+		}
+		if self.filtering() == Filtering::Reserved {
+			return Err(Error::BadInputs("Filtering cannot be set to Reserved variant".to_string()))
 		}
 		Ok(())
 	}
@@ -919,6 +1271,19 @@ pub enum Irq {
 	CrcOk = 0x09
 }
 
+#[derive(FromPrimitive,PartialEq,Debug)]
+pub enum DCFree {
+	None = 0x00,
+	Manchester = 0x01,
+	Whitening = 0x02,
+	Reserved = 0x03
+}
 
-
+#[derive(FromPrimitive,PartialEq,Debug)]
+pub enum Filtering {
+	None = 0x00,
+	Address = 0x01,
+	Both = 0x02,
+	Reserved = 0x03
+}
 	

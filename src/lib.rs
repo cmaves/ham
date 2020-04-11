@@ -12,13 +12,15 @@ pub mod tests;
 
 #[derive(Debug)]
 pub enum Error {
-	GpioError(gpio_cdev::errors::Error),
-	InitError(String),
-	IoError(std::io::Error),
-	BadInputs(String),
-	BadMessage(String, Option<Vec<u8>>),
-	Timeout(String),
-	ChipMalfunction(String)
+	GpioError(gpio_cdev::errors::Error), // error with Gpio device
+	Init(String), // error initializing device TODO: should this be removed
+	IoError(std::io::Error), // IO error, typically SPI
+	BadInputs(String), // input given to message was bad
+	BadMessage(String,Option<usize>), // a mangled message was received
+	Timeout(String), // 
+	ChipMalfunction(String), // chip is behaving unexpectedly
+	BufferOverflow(usize), // a buffer that was passed was to small
+	Unrecoverable(String) // device is unrecoverable state
 }
 impl From<gpio_cdev::errors::Error> for Error {
 	fn from(v: gpio_cdev::errors::Error) -> Self {
@@ -63,3 +65,41 @@ fn cond_set_bit(byte: u8, bit: u8, cond: bool) -> u8 {
 fn set_bit_to(byte: u8, bit: u8, val: bool) -> u8 {
 	cond_set_bit(unset_bit(byte, bit), bit, val)
 }
+
+
+trait PacketReceiver {
+	fn recv_packet(&mut self) -> Result<Vec<u8>, Error>;
+}
+trait IntoPacketReceiver {
+	type Recv: PacketReceiver;
+	fn into_packet_receiver(self) -> Result<Self::Recv, Error>;
+}
+impl <T: PacketReceiver> IntoPacketReceiver for T {
+	type Recv = T;
+	#[inline] fn into_packet_receiver(self) -> Result<Self::Recv, Error> { Ok(self) }
+}
+
+trait NetworkPacketReceiver<N>: PacketReceiver {
+	fn set_network(&mut self, netaddr: N) -> Result<(), Error>;
+}
+trait AddressPacketReceiver<N, A>: NetworkPacketReceiver<N> {
+	fn set_addr(&mut self, addr: A) -> Result<(), Error>;
+}
+trait BroadcastPacketReceiver<N, A>: AddressPacketReceiver<N, A> {
+	fn set_broadcast(&mut self, addr: A) -> Result<(), Error>;
+}
+trait VerifiedPacketReceiver: PacketReceiver {
+	fn recv_v_packet(&mut self, bytes: &mut [u8]) -> Result<usize, Error>;
+}
+
+enum ConfigMessage<N,A> 
+{
+	SetNetwork(N),
+	SetAddr(A),
+	SetBroadcast(A),
+	Terminate,
+	Pause,
+	Start
+}
+
+pub enum Void {}

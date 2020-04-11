@@ -7,9 +7,11 @@ use rand::prelude::*;
 
 fn test_sync_config() -> SyncConfig {
 	let mut sc = SyncConfig::default();
+	let mut syncword = [0; 8];
 	for i in 0..8 {
-		sc.syncword[i] = i as u8 + 1;	
+		syncword[i] = i as u8 + 1;	
 	}
+	sc.set_sync_word(&syncword);
 	sc
 }
 #[test]
@@ -65,24 +67,29 @@ fn send_recv_fixed() {
 	let mut rfm2 = Rfm69::new(rst, en, spidev).unwrap();
 	rfm2.set_sync(&sc).unwrap();
 
-	let mut msg = Vec::with_capacity(255);
+	let mut msg = [0; 255];
 	let mut rng = thread_rng();
 
-	for i in &[8_u8, 16, 32, 64, 128, 255] {
-		pc.set_len(*i);
+	for i in &[8_usize, 16, 32, 64, 128, 255] {
+		let i = *i;
+		pc.set_len(i as u8);
 		rfm1.set_config(&pc).unwrap();
 		rfm2.set_config(&pc).unwrap();
-	
-		msg.resize(*i as usize, 0);
-		rng.try_fill(msg.as_mut_slice()).unwrap();
-		let copy = msg.clone();
+		rng.try_fill(&mut msg[..i]).unwrap();
+		let mut cpy = [0; 255];
+		cpy[..i].copy_from_slice(&msg[..i]);
 		let recv = spawn(move || {
-			let recvd = rfm1.recv(Duration::from_secs(5)).unwrap();
-			assert_eq!(recvd,copy);
+			let mut recvd = [0; 255];
+			let len = rfm1.recv(&mut recvd[..i], Duration::from_secs(5)).unwrap();
+			rfm1.set_mode(Mode::Standby).unwrap();
+			assert_eq!(len,i);
+			assert_eq!(recvd[..i],cpy[..i]);
 			rfm1
 		});	
 		sleep(Duration::from_secs(1));
-		rfm2.send(&msg).unwrap();
+		rfm2.send(&msg[..i]).unwrap();
+		sleep(Duration::from_secs_f64((i as f64 + 8.0 + 2.0 + 2.0) * 8.0 / rfm2.bitrate() as f64));
+		rfm2.send(&msg[..i]).unwrap();
 		rfm1 = recv.join().unwrap(); // check if other thread paniced
 	}
 }
@@ -101,7 +108,7 @@ fn send_recv_variable() {
 	let spidev = Spidev::open("/dev/spidev0.1").unwrap();
 	let mut rfm2 = Rfm69::new(rst, en, spidev).unwrap();
 
-	let mut msg = Vec::with_capacity(256);
+	let mut msg = [0; 256];
 	let mut rng = thread_rng();
 
 	rfm1.set_config(&pc).unwrap();
@@ -109,22 +116,25 @@ fn send_recv_variable() {
 	let sc = test_sync_config();
 	rfm1.set_sync(&sc).unwrap();
 	rfm2.set_sync(&sc).unwrap();
-	for i in &[8_u8, 16, 32, 64, 65, 67, 128, 255] {
-	
-		msg.resize(*i as usize + 1, 0);
-		rng.try_fill(msg.as_mut_slice()).unwrap();
-		msg[0] = *i;
-		let copy = Vec::from(&msg[1..]);
+	for i in &[8_usize, 16, 32, 64, 65, 67, 128, 255] {
+		let i = *i;
+		rng.try_fill(&mut msg[..i+1]).unwrap();
+		msg[0] = i as u8;
+		let mut cpy = [0; 255];
+		cpy[..i].copy_from_slice(&msg[1..i+1]);
 		let recv = spawn(move || {
-			let recvd = rfm1.recv(Duration::from_secs(5)).unwrap();
+			let mut recvd = [0; 255];
+			let len = rfm1.recv(&mut recvd[..i], Duration::from_secs(5)).unwrap();
 			rfm1.set_mode(Mode::Standby).unwrap();
-			assert_eq!(recvd,copy);
+			eprintln!("Rssi: {}", rfm1.rssi().unwrap());
+			assert_eq!(len,i);
+			assert_eq!(recvd[..i],cpy[..i]);
 			rfm1
 		});	
 		sleep(Duration::from_secs(1));
-		rfm2.send(&msg).unwrap();
-		sleep(Duration::from_secs_f64((*i as f64 + 8.0 + 2.0 + 2.0) * 8.0 / rfm2.bitrate() as f64));
-		rfm2.send(&msg).unwrap();
+		rfm2.send(&msg[..i+1]).unwrap();
+		sleep(Duration::from_secs_f64((i as f64 + 8.0 + 2.0 + 2.0) * 8.0 / rfm2.bitrate() as f64));
+		rfm2.send(&msg[..i+1]).unwrap();
 		rfm1 = recv.join().unwrap(); // check if other thread paniced
 	}
 
@@ -159,6 +169,33 @@ fn mode() {
 		let mode = *mode;
 		rfm.set_mode(mode).unwrap();
 		assert_eq!(rfm.mode(), mode);
-		assert_eq!(rfm.mode_dev().unwrap(), mode);
+		rfm.validate_dev().unwrap();
 	}
+}
+
+#[test]
+fn power() {
+	let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	let rst = chip.get_line(24).unwrap();
+	let en = chip.get_line(3).unwrap();
+	let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
+	rfm.set_mode(Mode::Tx).unwrap();
+	assert_eq!(rfm.power().unwrap(), 13);
+	rfm.validate_dev().unwrap();
+	rfm.set_power(-18).unwrap();
+	assert_eq!(rfm.power().unwrap(), -18);
+	rfm.validate_dev().unwrap();
+	rfm.set_power(2).unwrap();
+	assert_eq!(rfm.power().unwrap(), 2);
+	rfm.validate_dev().unwrap();
+	rfm.set_power(17).unwrap();
+	assert_eq!(rfm.power().unwrap(), 17);
+	rfm.validate_dev().unwrap();
+	rfm.set_power(20).unwrap();
+	assert_eq!(rfm.power().unwrap(), 20);
+	rfm.validate_dev().unwrap();
+	rfm.set_power(13).unwrap();
+	assert_eq!(rfm.power().unwrap(), 13);
+	rfm.validate_dev().unwrap();
 }
