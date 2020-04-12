@@ -6,13 +6,14 @@ use crate::rfm69::{SyncConfig,Rfm69,PacketConfig,DCFree,Filtering,Mode};
 
 use reed_solomon::Encoder;
 use std::sync::mpsc::{channel,Sender};
-use std::thread::{JoinHandle,spawn};
+use std::thread::{JoinHandle,Builder as ThreadBuilder};
 use std::time::Duration;
 
 pub struct Rfm69PS {
 	rfm_thread: JoinHandle<Result<Rfm69,(Error, Rfm69)>>,
 	conf_sender: Sender<ConfigMessage<[u8; 8], u8>>,
-	encoder: Encoder
+	encoder: Encoder,
+	verbose: bool
 }
 impl Rfm69PS {
 	pub fn terminate(self) -> Result<Rfm69, (Error, Option<Rfm69>)> {
@@ -20,16 +21,30 @@ impl Rfm69PS {
 		self.rfm_thread.join().map_err(|_| (Error::Unrecoverable("The sender thread panicked!".to_string()), None))?
 			.map_err(|e| (e.0, Some(e.1)))
 	}
+	fn configure(&self, conf_msg: ConfigMessage<[u8; 8], u8>) -> Result<(), Error> {
+		self.conf_sender.send(conf_msg).map_err(|_| Error::Unrecoverable("Packet sender thread is disconnected.".to_string()))
+	}
+	pub fn alive(&mut self) -> Result<(), Error> {
+		self.configure(ConfigMessage::Alive)
+	}
+	pub fn set_verbose(&mut self, verbose: bool) -> Result<(), Error> {
+		self.configure(ConfigMessage::Verbose(verbose))?;
+		self.verbose = verbose;
+		Ok(())
+	}
 }
 
 impl PacketSender for Rfm69PS {
 	fn send_packet(&mut self, msg: &[u8], start_time: u32) -> Result<(), Error> {
-		assert!(msg.len() <= 235);
-		let mut vec = Vec::with_capacity(msg.len() + 16 + 4);
+		assert!(msg.len() <= 234);
+		let msglen = msg.len() + 16 + 4; // msg + ecc + time
+		let mut vec = Vec::with_capacity(msglen + 1); // msglen + len byte
+		vec.push(msglen as u8);
 		vec.extend_from_slice(&start_time.to_be_bytes());
 		vec.extend_from_slice(msg);
-		let encoded = self.encoder.encode(&vec[..]);
+		let encoded = self.encoder.encode(&vec[1..]);
 		vec.extend_from_slice(encoded.ecc());
+		eprintln!("sending message: {:02X?}", vec);
 		let vec = ConfigMessage::SendMessage(vec);
 		self.conf_sender.send(vec).map_err(|_| Error::Unrecoverable("Sending thread is disconnected!".to_string()))
 	}
@@ -42,10 +57,14 @@ impl IntoPacketSender for Rfm69 {
 		self.set_mode_internal(Mode::Standby)?;
 		let (conf_sender, conf_recv) = channel();
 		let encoder = Encoder::new(16);
-		let rfm_thread = spawn(move || {
+		let builder = ThreadBuilder::new().name("rfm69_sender".to_string());
+		let mut _verbose = false;
+		let rfm_thread = builder.spawn(move || {
 			let mut init_dev = ||{
 				let pc = *PacketConfig::default().set_variable(true).set_crc(false);
 				self.set_config(pc)?;
+				//let sc = *SyncConfig::default().set_on(false);
+				//self.set_sync(sc)?;
 				self.get_mode_ready()?.check_and_wait(Duration::from_millis(10))?;
 				self.set_mode(Mode::Tx)
 			};
@@ -62,16 +81,20 @@ impl IntoPacketSender for Rfm69 {
 							}
 						},
 						ConfigMessage::Terminate => return Ok(self),
+						ConfigMessage::Alive => (),
+						ConfigMessage::Verbose(v) => {
+							_verbose = v;
+							self.set_verbose(v)
+						}
 						_ => unreachable!()
 					}
-					unimplemented!();
 				} else {
 					return Err((Error::Unrecoverable("Sender thread: Sender message channel is disconnected!".to_string()), self))
 
 				}
 			}
-		});
-		Ok(Rfm69PS{conf_sender, rfm_thread, encoder})
+		}).unwrap();
+		Ok(Rfm69PS{conf_sender, rfm_thread, encoder, verbose: false})
 	}
 }
 

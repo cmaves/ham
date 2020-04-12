@@ -1,5 +1,7 @@
 use gpio_cdev::Chip;
 use ham::rfm69::{PacketConfig,Rfm69,SyncConfig,Mode};
+use ham::{IntoPacketReceiver,IntoPacketSender};
+use ham::{PacketReceiver,PacketSender,Error};
 use spidev::Spidev;
 use std::thread::{spawn,sleep};
 use std::time::Duration;
@@ -69,6 +71,7 @@ fn send_recv_fixed() {
 	rfm2.set_sync(&sc).unwrap();
 
 	let mut msg = [0; 255];
+	let mut cpy = [0; 255];
 	let mut rng = thread_rng();
 
 	for i in &[8_usize, 16, 32, 64, 128, 255] {
@@ -77,7 +80,6 @@ fn send_recv_fixed() {
 		rfm1.set_config(&pc).unwrap();
 		rfm2.set_config(&pc).unwrap();
 		rng.try_fill(&mut msg[..i]).unwrap();
-		let mut cpy = [0; 255];
 		cpy[..i].copy_from_slice(&msg[..i]);
 		let recv = spawn(move || {
 			let mut recvd = [0; 255];
@@ -110,6 +112,7 @@ fn send_recv_variable() {
 	let mut rfm2 = Rfm69::new(rst, en, spidev).unwrap();
 
 	let mut msg = [0; 256];
+	let mut cpy = [0; 255];
 	let mut rng = thread_rng();
 
 	rfm1.set_config(&pc).unwrap();
@@ -121,7 +124,6 @@ fn send_recv_variable() {
 		let i = *i;
 		rng.try_fill(&mut msg[..i+1]).unwrap();
 		msg[0] = i as u8;
-		let mut cpy = [0; 255];
 		cpy[..i].copy_from_slice(&msg[1..i+1]);
 		let recv = spawn(move || {
 			let mut recvd = [0; 255];
@@ -200,4 +202,65 @@ fn power() {
 	assert_eq!(rfm.power().unwrap(), 13);
 	rfm.validate_dev().unwrap();
 }
+#[test]
+fn packetreceiver_sender() {
+	let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	let rst = chip.get_line(24).unwrap();
+	let en = chip.get_line(3).unwrap();
+	let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	let rfm1 = Rfm69::new(rst, en, spidev).unwrap();
+	let bitrate = rfm1.bitrate();
+	let mut receiver = rfm1.into_packet_receiver().unwrap();
 
+	let rst = chip.get_line(2).unwrap();
+	let en = chip.get_line(4).unwrap();
+	let spidev = Spidev::open("/dev/spidev0.1").unwrap();
+	let rfm2 = Rfm69::new(rst, en, spidev).unwrap();
+	let mut sender = rfm2.into_packet_sender().unwrap();
+	sender.set_verbose(true).unwrap();
+
+	let mut msg = [0; 234];
+	let mut cpy = [0; 234];
+	let mut rng = thread_rng();
+
+	for i in &[0_usize, 1, 8, 16, 32, 64, 128, 234] {
+		let i = *i;
+		rng.try_fill(&mut msg[..i]).unwrap();
+		cpy[..i].copy_from_slice(&msg[..i]);
+		let time = i as u32 * 1_000_000;
+		receiver.set_verbose(true).unwrap();
+		receiver.start().unwrap();
+		let recv = spawn(move || {
+			eprintln!("Waiting up to 5 seconds for reception....");
+			match receiver.recv_packet_timeout(Duration::from_secs(5)) {
+				Ok((recvd, _)) => {
+					assert_eq!(recvd[..i],cpy[..i]);
+					let cur_time = receiver.cur_time().unwrap();
+					assert!(cur_time  >= time && cur_time <= time + 1_000_000);
+					receiver.terminate().ok().unwrap().into_packet_receiver().unwrap()
+				},
+				Err(e) => panic!("Error {:?}, getting error from thread: {:?}", e, receiver.terminate().map_err(|(e, _)| e).err().unwrap()),
+			}
+		});	
+		sleep(Duration::from_secs(1));
+		let mut send = || {
+			sender.send_packet(&msg[..i], time)?;
+			sleep(Duration::from_secs_f64((i as f64 + 8.0 + 2.0 + 2.0 + 21.0) * 8.0 / bitrate as f64));
+			sender.send_packet(&msg[..i], time)
+		};
+		if let Err(_) = send() {
+			panic!("Receive thread disconnected, getting error: {:?}", sender.terminate().map_err(|(e, _)| e).err().unwrap());
+		}
+		receiver = match recv.join() { // check if other thread panicked
+			Ok(v) => v,
+			Err(e) => {
+				// the other thread will panic if sending thread didnt succeed. It is more useful to get this error message
+				if let Err(_) = sender.alive() {
+					panic!("Receive thread disconnected, getting error: {:02?}", sender.terminate().map_err(|(e, _)| e).err().unwrap());
+				}
+				panic!("Test receiving thread panicked!")
+			}
+		}
+
+	}
+}

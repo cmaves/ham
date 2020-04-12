@@ -1,7 +1,5 @@
 
 use crate::{bit,cond_set_bit,set_bit,Error,set_bit_to,sleep,unset_bit,ConfigMessage,Void};
-use crate::{PacketReceiver,NetworkPacketReceiver,AddressPacketReceiver,BroadcastPacketReceiver};
-use crate::{IntoPacketReceiver};
 
 use gpio_cdev::{Line,LineHandle,LineRequestFlags,EventRequestFlags,LineEventHandle};
 use nix::poll;
@@ -23,7 +21,6 @@ pub use crate::rfm69::receiver::*;
 
 mod sender;
 pub use crate::rfm69::sender::*;
-
 
 pub struct Rfm69 {
 	rst: LineHandle,
@@ -176,8 +173,6 @@ impl Rfm69 {
 		self.fifo_thresh = 15;
 		self.validate_version()?;
 		self.get_mode_ready()?.check_and_wait(Duration::from_millis(10))?;
-		// TODO: implement the reset values
-		unimplemented!();
 		Ok(self)
 	}
 	pub fn validate_dev(&self) -> Result<(), Error> {
@@ -227,7 +222,7 @@ impl Rfm69 {
 		let count = count as usize;
 		let reg = [(reg as u8) & 0x7F];
 		let mut local = [0; 255];
-		let i_buf = &mut local[..count - buf.len()];
+		let i_buf = &mut local[..count.saturating_sub(buf.len())];
 
 		let addr_xfer =  SpidevTransfer::write(&reg);
 		let buf = if count >= buf.len() { buf } else { &mut buf[..count] };
@@ -320,6 +315,7 @@ impl Rfm69 {
 		}
 		let mut testpa = [0, 0, 0]; // middle byte is unused
 		self.read_many(Register::TestPa1, &mut testpa)?;
+		// determine the shift used when setting the dBm
 		let shift = if testpa[0] == 0x55 && testpa[2] == 0x70 {
 			match pa012 {
 				2|4 => -18,
@@ -565,6 +561,8 @@ impl Rfm69 {
 	fn send_variable(&self, payload: &[u8]) -> Result<(), Error> {
 		if payload.len() > 256 {
 			return Err(Error::BadInputs(format!("Buffer length ({}) cannot be greater than 255!", payload.len())));
+		} else if payload.len() < 2 {
+			return Err(Error::BadInputs("Buffer length must be at least two!".to_string()));
 		} else if self.pc.aes() {
 			if self.pc.filtering() != Filtering::None {
 				if payload.len() > 50 {
@@ -666,8 +664,13 @@ impl Rfm69 {
 				   I don't know if this is even possible. Should this be unreachable arm instead?
 				   With out CRC checking anything would be accept, so this are would represent a chip 
 				   malfunction.
+				   UPDATE: so clearly this is reachable but why, I'm not sure yet
 			     */ 
-				let s = "A payload ready was never received, after starting message reception. With no CRC, this should never happen.".to_string();
+				let mut fifo_dump = [0;66];
+				self.read_many_count(Register::Fifo, &mut fifo_dump, count)?;
+				let rs = Decoder::new(16);
+				let s = format!("A payload ready was never received, after starting message reception. With no CRC, this should never happen! dumping fifo:\n{:#04X?}\ngood validation: {}",
+					&fifo_dump[..count as usize], !rs.is_corrupted(&fifo_dump[..count as usize]));
 				return Err(Error::ChipMalfunction(s));
 			}
 			let s = "A CRC Error occured!".to_string();
@@ -690,10 +693,11 @@ impl Rfm69 {
 		let ret = if len as usize  > buf.len() { buf.len() } else { len as usize };
 		if len <= 66 {
 			// short messages can be read in one go
-			eprintln!("Doing fixed_recv() short message");
+			if self.verbose { eprintln!("Doing fixed_recv(): short message {} ", len); }
 			self.fifo_read_no_check(buf, len, timeout).map(|_| ret)
 		} else {
 			// long messages are required to be read continously
+			if self.verbose { eprintln!("Doing fixed_recv(): long message {} ", len); }
 			self.fifo_read(buf, len, timeout).map(|_| ret)
 		}
 	}
@@ -703,9 +707,10 @@ impl Rfm69 {
 		let len = self.read(Register::Fifo)?;
 		let ret = len as usize;
 		if len <= 66 {
-			eprintln!("Doing variable_recv() short message {}", len);
+			if self.verbose { eprintln!("Doing recv_variable(): short message {}", len); }
 			self.fifo_read_no_check(buf, len, timeout).map(|_| ret)
 		} else {
+			if self.verbose { eprintln!("Doing recv_variable(): long message {}", len); }
 			self.fifo_read(buf, len , timeout).map(|_| ret)
 		}
 
@@ -747,7 +752,9 @@ impl Rfm69 {
 	pub fn mode_dev(&self) -> Result<Mode, std::io::Error> {
 		let mode = self.read(Register::OpMode)? & 0x7F;
 		Ok(Mode::from_u8(mode).unwrap())
-
+	}
+	pub fn set_verbose(&mut self, verbose: bool) {
+		self.verbose = verbose
 	}
 }
 impl Drop for Rfm69 {
@@ -1005,6 +1012,11 @@ impl PacketConfig {
 	#[inline]
 	pub fn clear(&self) -> bool {
 		bit(self.0[0], 3)
+	}
+	#[inline]
+	pub fn set_clear(&mut self, val: bool) -> &mut Self {
+		self.0[0] = set_bit_to(self.0[0], 3, val);
+		self
 	}
 	#[inline]
 	pub fn crc(&self) -> bool {
