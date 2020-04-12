@@ -67,7 +67,7 @@ fn set_bit_to(byte: u8, bit: u8, val: bool) -> u8 {
 
 trait PacketReceiver {
 	fn cur_time(&self) -> Result<u32, Error>;
-	fn recv_packet(&mut self) -> Result<Vec<u8>, Error>;
+	fn recv_packet(&mut self) -> Result<(Vec<u8>, Address), Error>;
 }
 trait IntoPacketReceiver {
 	type Recv: PacketReceiver;
@@ -91,14 +91,40 @@ trait VerifiedPacketReceiver: PacketReceiver {
 	fn recv_v_packet(&mut self, bytes: &mut [u8]) -> Result<usize, Error>;
 }
 
+trait PacketSender {
+	fn send_packet(&mut self, msg: &[u8], start_time: u32) -> Result<(), Error>;
+}
+trait IntoPacketSender {
+	type Send: PacketSender;
+	fn into_packet_sender(self) -> Result<Self::Send, Error>;
+}
+trait AddressPacketSender<N, A>: NetworkPacketReceiver<N> {
+	fn send_packet_to(&mut self, addr: A) -> Result<(), Error>;
+}
+trait VerifiedPacketSender: PacketSender {
+	fn send_v_packet(&self) -> Result<(), Error>;
+}
+impl <T: PacketSender> IntoPacketSender for T {
+	type Send = T;
+	fn into_packet_sender(self) -> Result<Self::Send, Error> {
+		Ok(self)
+	}
+}
+
 enum ConfigMessage<N,A> 
 {
 	SetNetwork(N),
 	SetAddr(A),
 	SetBroadcast(A),
+	SendMessage(Vec<u8>),
 	Terminate,
 	Pause,
 	Start
+}
+pub enum Address {
+	None,
+	Address,
+	Broadcast
 }
 
 pub enum Void {}

@@ -22,5 +22,5 @@ spin_sleep = { version = "0.3.7", optional = true }
 [dev-dependencies]
 rand = "0.7"
 
-
-
+[profile.release]
+lto = true
