@@ -108,6 +108,31 @@ const MIN_FREQ: u32 = 290_000_000;
 const MAX_FREQ: u32 = 1020_000_000;
 
 impl Rfm69 {
+
+	/// Creates a new instance of the device to control the RFM69HCW chip. 
+	///
+	/// `rst` represents the reset pin on the chip.
+	/// `en` should be enable pin on the chip.
+	/// `spi` uses the all of the SPI pins, including the corresponding CS/CE pins.
+	///  All SPI commands performed by `Rfm69` are atomic allowing other SPI devices to be used alongside with the RFM69 chip.
+	///  By default, the DIO pins are not used by this driver. 
+	///  This function configures some the RFM69 registers to recommened values and does some basic validation to ensure the device appears to be wired correctly.
+	///
+	///  # Example 
+	///
+	/// ```
+	/// // On a Raspberry Pi 3
+	/// use gpio_cdev::Chip;
+	/// use spidev::Spidev;
+	/// use ham::rfm69::Rfm69;
+	///
+	/// let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// let rst = chip.get_line(24).unwrap();
+	/// let en = chip.get_line(3).unwrap();
+	/// let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// assert_eq!(0x24, rfm.get_version().unwrap());
+	/// ```
 	pub fn new(rst: Line, en: Line, mut spi: Spidev) -> Result<Self, Error> {
 		let flags = LineRequestFlags::OUTPUT;
 		let rst = rst.request(flags, 1, "rfm69_reset")?;
@@ -138,6 +163,57 @@ impl Rfm69 {
 		})().map_err(|e| Error::Init(format!("Device failed to init!: {:?}", e)))?;
 		Ok(rfm)
 	}
+	/// Sets the [`Mode`] of the Rfm69 chip and waits until device signals is ready.
+	/// 
+	/// If the `Rfm69`'s mode is already in the given `mode` then this function does nothing.
+	/// After setting the mode on the device this method will wait up to 10 ms, before timing out.
+	pub fn set_mode(&mut self, mode: Mode) -> Result<(), Error> {
+		self.set_mode_internal(mode)?;
+		// wait for mode to be set
+		let iw = self.get_mode_ready()?;
+		iw.check_and_wait(Duration::from_millis(10))
+	}
+	/// Returns the [`Mode`] of the device.
+	///
+	/// The value returned is the `Mode` stored by the controller.
+	/// This could differ from the actual device's mode if an error has occurred or if the [`write()`]/[`write_many()`] methods are used directly are used directly.
+	/// [`mode_dev()`] will get the `Mode` from the device, instead of the stored mode.o
+	///
+	/// # Example 
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::{Rfm69,Mode};
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// assert_eq!(rfm.mode(), Mode::Standby);
+	/// ```
+	///
+	/// [`Mode`]: ./enum.Mode.html
+	/// [`mode_dev()`]: ./struct.Rfm69.html#method.mode_dev
+	/// [`write()`]: ./struct.Rfm69.html#method.write
+	/// [`write_many()`]:  ./struct.Rfm69.html#method.write_many
+ 	#[inline]
+	pub fn mode(&self) -> Mode {
+		self.mode
+	}
+	/// Returns the [`Mode`] of the actual RFM69 device.
+	///
+	/// The value returned is the `Mode` stored on the actual device.
+	/// This is in contrast to [`mode()`] which gets the stored `Mode` from the controller.
+	/// 
+	/// [`Mode`]: ./enum.Mode.html
+	/// [`mode()`]: ./struct.Rfm69.html#method.mode
+	#[inline]
+	pub fn mode_dev(&self) -> Result<Mode, std::io::Error> {
+		let mode = self.read(Register::OpMode)? & 0x7F;
+		Ok(Mode::from_u8(mode).unwrap())
+	}
+
 	pub fn set_preamble_len(&mut self, len: u16) -> Result<(), Error> {
 		self.write_many(Register::PreambleMsb, &len.to_be_bytes())?;
 		self.preamble = len;
@@ -145,6 +221,21 @@ impl Rfm69 {
 	}
 	pub fn preamble_len(&self) -> u16 {
 		self.preamble
+	}
+	#[inline]
+	pub fn set_dio(&mut self, index: u8, line: Option<Line>) {
+		assert!(index < 6);
+		self.dios[index as usize] = line;
+	
+	}
+	#[inline]
+	pub fn set_dios(&mut self, lines: &[Option<Line>]) {
+		for (dst, src) in self.dios.iter_mut().zip(lines.iter()) {
+			*dst = src.clone();
+		}
+	}
+	pub fn dios(&self) -> &[Option<Line>; 6] {
+		&self.dios
 	}
 	pub fn preamble_len_dev(&self) -> Result<u16, Error> {
 		let mut len = [0; 2];
@@ -733,20 +824,6 @@ impl Rfm69 {
 		}
 		self.mode = mode;
 		Ok(())
-	}
-	pub fn set_mode(&mut self, mode: Mode) -> Result<(), Error> {
-		self.set_mode_internal(mode)?;
-		// wait for mode to be set
-		let iw = self.get_mode_ready()?;
-		iw.check_and_wait(Duration::from_millis(10))
-	}
- 	#[inline]
-	pub fn mode(&self) -> Mode {
-		self.mode
-	}
-	pub fn mode_dev(&self) -> Result<Mode, std::io::Error> {
-		let mode = self.read(Register::OpMode)? & 0x7F;
-		Ok(Mode::from_u8(mode).unwrap())
 	}
 	pub fn set_verbose(&mut self, verbose: bool) {
 		self.verbose = verbose
