@@ -1,5 +1,5 @@
 
-use crate::{bit,cond_set_bit,set_bit,Error,set_bit_to,sleep,unset_bit,ConfigMessage,Void};
+use crate::{bit,set_bit,Error,set_bit_to,sleep,unset_bit};
 
 use gpio_cdev::{Line,LineHandle,LineRequestFlags,EventRequestFlags,LineEventHandle};
 use nix::poll;
@@ -7,13 +7,9 @@ use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 use reed_solomon::Decoder;
 use spidev::{Spidev,SpidevTransfer,SpidevOptions,SpiModeFlags};
-use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::fmt;
 use std::os::unix::io::AsRawFd;
-use std::sync::mpsc::{SyncSender,Receiver,sync_channel,channel};
-use std::sync::{Arc,RwLock};
-use std::thread::{JoinHandle,spawn};
 use std::time::{Instant,Duration};
 
 mod receiver;

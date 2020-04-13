@@ -1,5 +1,5 @@
 
-use crate::{bit,cond_set_bit,set_bit,Error,set_bit_to,sleep,unset_bit,ConfigMessage,Void};
+use crate::{Error,ConfigMessage};
 use crate::{PacketReceiver,NetworkPacketReceiver,AddressPacketReceiver,BroadcastPacketReceiver};
 use crate::{IntoPacketReceiver,Address};
 use crate::rfm69::{SyncConfig,Rfm69,PacketConfig,DCFree,Filtering,Mode};
@@ -97,7 +97,7 @@ impl IntoPacketReceiver for Rfm69 {
 		let rfm_thread = builder.spawn(move ||{ 
 			let clock = clock_clone;
 			let mut init_dev = ||{
-				let pc = *PacketConfig::default().set_variable(true).set_len(255).set_crc(false);//.set_clear(false);
+				let pc = *PacketConfig::default().set_variable(true).set_len(255).set_crc(false).set_dc(DCFree::Whitening);
 				self.set_config(pc)?;
 				let sc = *SyncConfig::default().set_sync_word(&[0x56, 0xa9, 0x0b, 0x9a]).set_len(4);
 				self.set_sync(sc)?;

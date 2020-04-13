@@ -70,7 +70,7 @@ impl IntoPacketSender for Rfm69 {
 		let mut _verbose = false;
 		let rfm_thread = builder.spawn(move || {
 			let mut init_dev = ||{
-				let pc = *PacketConfig::default().set_variable(true).set_crc(false);
+				let pc = *PacketConfig::default().set_variable(true).set_crc(false).set_dc(DCFree::Whitening);
 				self.set_config(pc)?;
 				let sc = *SyncConfig::default().set_sync_word(&[0x56, 0xa9, 0x0b, 0x9a]).set_len(4);
 				self.set_sync(sc)?;
