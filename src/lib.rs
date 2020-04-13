@@ -100,7 +100,10 @@ pub trait IntoPacketSender {
 	type Send: PacketSender;
 	fn into_packet_sender(self) -> Result<Self::Send, Error>;
 }
-trait AddressPacketSender<N, A>: NetworkPacketReceiver<N> {
+pub trait NetworkPacketSender<N>: PacketSender {
+	fn set_network(&mut self, netaddr: N) -> Result<(), Error>;
+}
+trait AddressPacketSender<N, A>: NetworkPacketSender<N> {
 	fn send_packet_to(&mut self, addr: A) -> Result<(), Error>;
 }
 trait VerifiedPacketSender: PacketSender {

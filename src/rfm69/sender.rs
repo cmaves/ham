@@ -1,6 +1,6 @@
 
 use crate::{bit,cond_set_bit,set_bit,Error,set_bit_to,sleep,unset_bit,ConfigMessage,Void};
-use crate::{PacketSender,NetworkPacketReceiver,AddressPacketReceiver,BroadcastPacketReceiver};
+use crate::{PacketSender,NetworkPacketSender,AddressPacketReceiver,BroadcastPacketReceiver};
 use crate::IntoPacketSender;
 use crate::rfm69::{SyncConfig,Rfm69,PacketConfig,DCFree,Filtering,Mode};
 
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 pub struct Rfm69PS {
 	rfm_thread: JoinHandle<Result<Rfm69,(Error, Rfm69)>>,
-	conf_sender: Sender<ConfigMessage<[u8; 8], u8>>,
+	conf_sender: Sender<ConfigMessage<[u8; 4], u8>>,
 	encoder: Encoder,
 	verbose: bool
 }
@@ -21,7 +21,7 @@ impl Rfm69PS {
 		self.rfm_thread.join().map_err(|_| (Error::Unrecoverable("The sender thread panicked!".to_string()), None))?
 			.map_err(|e| (e.0, Some(e.1)))
 	}
-	fn configure(&self, conf_msg: ConfigMessage<[u8; 8], u8>) -> Result<(), Error> {
+	fn configure(&self, conf_msg: ConfigMessage<[u8; 4], u8>) -> Result<(), Error> {
 		self.conf_sender.send(conf_msg).map_err(|_| Error::Unrecoverable("Packet sender thread is disconnected.".to_string()))
 	}
 	pub fn alive(&mut self) -> Result<(), Error> {
@@ -49,6 +49,15 @@ impl PacketSender for Rfm69PS {
 		self.conf_sender.send(vec).map_err(|_| Error::Unrecoverable("Sending thread is disconnected!".to_string()))
 	}
 }
+
+impl NetworkPacketSender<&[u8]> for Rfm69PS {
+	fn set_network(&mut self, netaddr: &[u8]) -> Result<(), Error> {
+		assert!(netaddr.len() <= 4);
+		let mut msg = [0;4];
+		msg[..netaddr.len()].copy_from_slice(&netaddr[..netaddr.len()]);
+		self.configure(ConfigMessage::SetNetwork(msg))
+	}
+}
 	
 
 impl IntoPacketSender for Rfm69 {
@@ -63,8 +72,8 @@ impl IntoPacketSender for Rfm69 {
 			let mut init_dev = ||{
 				let pc = *PacketConfig::default().set_variable(true).set_crc(false);
 				self.set_config(pc)?;
-				//let sc = *SyncConfig::default().set_on(false);
-				//self.set_sync(sc)?;
+				let sc = *SyncConfig::default().set_sync_word(&[0x56, 0xa9, 0x0b, 0x9a]).set_len(4);
+				self.set_sync(sc)?;
 				self.get_mode_ready()?.check_and_wait(Duration::from_millis(10))?;
 				self.set_mode(Mode::Tx)
 			};

@@ -13,7 +13,7 @@ use std::time::{Instant,Duration};
 
 pub struct Rfm69PR {
 	rfm_thread: JoinHandle<Result<Rfm69,(Error, Rfm69)>>,
-	conf_sender: SyncSender<ConfigMessage<[u8; 8], u8>>,
+	conf_sender: SyncSender<ConfigMessage<[u8; 4], u8>>,
 	msg_recv: Receiver<(Vec<u8>, Address)>,
 	clock: Arc<RwLock<(Instant, u32)>>,
 	started: bool,
@@ -25,7 +25,7 @@ impl Rfm69PR {
 		self.rfm_thread.join().map_err(|_| {(Error::Unrecoverable("The receiver thread paniced!".to_string()), None)})?
 			.map_err(|e| { (e.0, Some(e.1)) })
 	}
-	fn configure(&self, conf_msg: ConfigMessage<[u8; 8], u8>) -> Result<(), Error> {
+	fn configure(&self, conf_msg: ConfigMessage<[u8; 4], u8>) -> Result<(), Error> {
 		self.conf_sender.send(conf_msg).map_err(|_| Error::Unrecoverable("Packet receiver thread is disconnected.".to_string()))
 	}
 	pub fn alive(&mut self) -> Result<(), Error> {
@@ -38,42 +38,51 @@ impl Rfm69PR {
 	}
 
 }
-fn config_net(netaddr: [u8; 8], rfm: &mut Rfm69) -> Result<(), Error> {
-	let mut sc = SyncConfig::default();
-	let len = netaddr.iter().position(|x| *x == 0x00).unwrap_or(8);
-	sc.set_sync_word(&netaddr[..len]);
-	sc.set_on(len != 0);
-	let mut pc = rfm.config();
-	if len != 0 {
-		sc.set_error(0);
-		sc.set_len(len as u8);
-		if pc.dc() != DCFree::Whitening { rfm.set_config(pc.set_dc(DCFree::Whitening))? }
-	} else if pc.dc() != DCFree::None {
-		rfm.set_config(pc.set_dc(DCFree::None))?;
+fn message(conf_msg: ConfigMessage<[u8; 4], u8>, rfm: &mut Rfm69, paused: &mut bool, verbose: &mut bool) -> Result<bool, Error> {
+	match conf_msg {
+		ConfigMessage::SetNetwork(netaddr) => {
+			let mut sc = SyncConfig::default();
+			let sync_word = [0x56, 0xA9, 0x09, 0x9A, netaddr[0], netaddr[1], netaddr[2], netaddr[3]];
+			let len = netaddr.iter().position(|x| *x == 0x00).unwrap_or(4) + 4;
+			sc.set_sync_word(&sync_word[..len]);
+			if sc != rfm.sync() { rfm.set_sync(sc); }
+			Ok(false)
+		},
+		ConfigMessage::SetAddr(addr) => {
+			let mut pc = *(rfm.config().set_address(addr));
+			if pc != rfm.config() { rfm.set_config(pc)?; } 
+			Ok(false)
+		},
+		ConfigMessage::SetBroadcast(addr) => {
+			let mut pc = *(rfm.config().set_broadcast(addr));
+			if pc != rfm.config() { rfm.set_config(pc)?; } 
+			Ok(false)
+		},
+		ConfigMessage::Verbose(v) => { 
+			*verbose = v; 
+			rfm.set_verbose(v);
+			Ok(false)
+		},
+		ConfigMessage::Start => {
+			if let Err(_) = rfm.set_mode(Mode::Rx) {
+				Err(Error::Unrecoverable("Reader thread: Rx mode could not be started.".to_string()))
+			} else {
+				*paused = false;
+				Ok(false)
+			}
+		},
+		ConfigMessage::Pause => {
+			if let Err(_) = rfm.set_mode(Mode::Standby) {
+				Err(Error::Unrecoverable("Reader thread: Rx mode could not be started.".to_string()))
+			} else {
+				*paused = true;
+				Ok(false)
+			}
+		},
+		ConfigMessage::Terminate => Ok(true),
+		ConfigMessage::Alive => Ok(false),
+		_ => unreachable!()
 	}
-	rfm.set_sync(sc)
-}
-fn config_addr(addr: u8, rfm: &mut Rfm69) -> Result<(), Error> {
-	let mut pc = *(rfm.config().set_address(addr));
-	if addr == 0 {
-		pc.set_filtering(Filtering::None);		
-	} else if pc.broadcast() == 0 {
-		pc.set_filtering(Filtering::Address);
-	} else {
-		pc.set_filtering(Filtering::Both);
-	}
-	if pc != rfm.config() { rfm.set_config(pc) } else { Ok(()) }
-}
-fn config_broad(addr: u8, rfm: &mut Rfm69) -> Result<(), Error> { 
-	let mut pc = *(rfm.config().set_broadcast(addr));
-	if addr == 0 {
-		pc.set_filtering(Filtering::None);		
-	} else if pc.broadcast() == 0 {
-		pc.set_filtering(Filtering::Address);
-	} else {
-		pc.set_filtering(Filtering::Both);
-	}
-	if pc != rfm.config() { rfm.set_config(pc) } else { Ok(()) }
 }
 
 impl IntoPacketReceiver for Rfm69 {
@@ -90,8 +99,8 @@ impl IntoPacketReceiver for Rfm69 {
 			let mut init_dev = ||{
 				let pc = *PacketConfig::default().set_variable(true).set_len(255).set_crc(false);//.set_clear(false);
 				self.set_config(pc)?;
-				//let sc = *SyncConfig::default().set_on(false).set_fill(true);
-				//self.set_sync(sc)?;
+				let sc = *SyncConfig::default().set_sync_word(&[0x56, 0xa9, 0x0b, 0x9a]).set_len(4);
+				self.set_sync(sc)?;
 				self.get_mode_ready()?.check_and_wait(Duration::from_millis(10))
 			};
 			// configure Rfm69 device for receiving and catch error
@@ -105,29 +114,9 @@ impl IntoPacketReceiver for Rfm69 {
 				// allocate space for the message
 				if paused {
 					if let Ok(v) = conf_recv.recv() {
-						if let Err(e) = match v {
-							// TODO: is thre some way to eliminate the duplicate code on lines 816
-							ConfigMessage::SetNetwork(netaddr) => config_net(netaddr, &mut self),
-							ConfigMessage::SetAddr(addr) => config_addr(addr, &mut self),
-							ConfigMessage::SetBroadcast(addr) => config_broad(addr, &mut self),
-							ConfigMessage::Terminate => return Ok(self),
-							ConfigMessage::Start => {
-								if let Err(_) = self.set_mode(Mode::Rx) {
-									return Err((Error::Unrecoverable("Reader thread: Rx mode could not be started.".to_string()),self));
-								}
-								paused = false; 
-								Ok(())
-							},
-							ConfigMessage::Pause|ConfigMessage::Alive => Ok(()),
-							ConfigMessage::Verbose(v) => { 
-								verbose = v; 
-								self.set_verbose(v);
-								Ok(())
-							},
-							_ => unreachable!()
-						} 
-						{
-							return Err((Error::Unrecoverable(format!("Reader thread: Device could not be configured!: {:?}", e)), self));
+						match message(v, &mut self, &mut paused, &mut verbose) {
+							Ok(terminate) => if terminate { return Ok(self); },
+							Err(e) => return Err((e, self))
 						}
 					} else {
 						return Err((Error::Unrecoverable("Reader thread: Receiver is paused and conf_recv is disconnected".to_string()), self));
@@ -145,28 +134,9 @@ impl IntoPacketReceiver for Rfm69 {
 					}
 					let cfg_msg = conf_recv.try_recv().ok();
 					if let Some(v) = cfg_msg {
-						if let Err(e) = match v {
-							ConfigMessage::SetNetwork(netaddr) => config_net(netaddr, &mut self),
-							ConfigMessage::SetAddr(addr) => config_addr(addr, &mut self),
-							ConfigMessage::SetBroadcast(addr) => config_broad(addr, &mut self),
-							ConfigMessage::Terminate => return Ok(self),
-							ConfigMessage::Pause => { 
-								if let Err(_) = self.set_mode(Mode::Standby) {
-									return Err((Error::Unrecoverable("Reader thread: Standby mode could not be started.".to_string()),self));
-								}
-								paused = true; 
-								Ok(())
-							},
-							ConfigMessage::Verbose(v) => {
-								verbose = v;
-								self.set_verbose(v);
-								Ok(())
-							},
-							ConfigMessage::Start|ConfigMessage::Alive =>  Ok(()),
-							_ => unreachable!()
-						} 
-						{
-								return Err((Error::Unrecoverable(format!("Reader thread: Device could not be configured!: {:?}", e)), self));
+						match message(v, &mut self, &mut paused, &mut verbose) {
+							Ok(terminate) => if terminate { return Ok(self); },
+							Err(e) => return Err((e, self))
 						}
 					} else {
 						let size = if let Ok(size) = res { size } else { continue; };
@@ -247,8 +217,8 @@ impl PacketReceiver for Rfm69PR {
 }
 impl NetworkPacketReceiver<&[u8]> for Rfm69PR {
 	fn set_network(&mut self, netaddr: &[u8]) -> Result<(), Error> {
-		assert!(netaddr.len() <= 8);
-		let mut msg = [0;8];
+		assert!(netaddr.len() <= 4);
+		let mut msg = [0;4];
 		msg[..netaddr.len()].copy_from_slice(&netaddr[..netaddr.len()]);
 		self.configure(ConfigMessage::SetNetwork(msg))
 	}

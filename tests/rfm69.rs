@@ -222,7 +222,6 @@ fn packetreceiver_sender() {
 	let mut msg = [0; 234];
 	let mut cpy = [0; 234];
 	let mut rng = thread_rng();
-
 	for i in &[0_usize, 1, 8, 16, 32, 64, 128, 234] {
 		let i = *i;
 		rng.try_fill(&mut msg[..i]).unwrap();
