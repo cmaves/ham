@@ -20,7 +20,7 @@ pub struct Rfm69PR {
 	verbose: bool
 }
 impl Rfm69PR {
-	pub fn terminate(mut self) -> Result<Rfm69, (Error, Option<Rfm69>)> {
+	pub fn terminate(self) -> Result<Rfm69, (Error, Option<Rfm69>)> {
 		self.conf_sender.send(ConfigMessage::Terminate).ok(); // ignore error
 		self.rfm_thread.join().map_err(|_| {(Error::Unrecoverable("The receiver thread paniced!".to_string()), None)})?
 			.map_err(|e| { (e.0, Some(e.1)) })
@@ -45,16 +45,16 @@ fn message(conf_msg: ConfigMessage<[u8; 4], u8>, rfm: &mut Rfm69, paused: &mut b
 			let sync_word = [0x56, 0xA9, 0x09, 0x9A, netaddr[0], netaddr[1], netaddr[2], netaddr[3]];
 			let len = netaddr.iter().position(|x| *x == 0x00).unwrap_or(4) + 4;
 			sc.set_sync_word(&sync_word[..len]);
-			if sc != rfm.sync() { rfm.set_sync(sc); }
+			if sc != rfm.sync() { rfm.set_sync(sc)?; }
 			Ok(false)
 		},
 		ConfigMessage::SetAddr(addr) => {
-			let mut pc = *(rfm.config().set_address(addr));
+			let pc = *(rfm.config().set_address(addr));
 			if pc != rfm.config() { rfm.set_config(pc)?; } 
 			Ok(false)
 		},
 		ConfigMessage::SetBroadcast(addr) => {
-			let mut pc = *(rfm.config().set_broadcast(addr));
+			let pc = *(rfm.config().set_broadcast(addr));
 			if pc != rfm.config() { rfm.set_config(pc)?; } 
 			Ok(false)
 		},

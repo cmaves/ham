@@ -61,7 +61,6 @@ impl IrqWait<'_> {
 				Err(e) => Err(Error::Timeout(format!("Interrupt poll error ({:?})!", e))) // a poll error
 			}
 		} else {
-			let start = Instant::now();
 			let reg = Register::from_u8(Register::IrqFlags1 as u8 + (self.irq as u8) / 8).unwrap();
 			let b = self.irq as u8 % 8;
 			let target = Instant::now() + timeout - self.check; // 
@@ -575,7 +574,7 @@ impl Rfm69 {
 
 		self.fifo_write(payload)
 	}
-	fn send_unlimited(&self, payload: &[u8]) -> Result<(), Error> {
+	fn send_unlimited(&self, _payload: &[u8]) -> Result<(), Error> {
 		unimplemented!()	
 	}
 	pub fn send(&mut self, payload: &[u8]) -> Result<(), Error> {
@@ -614,7 +613,7 @@ impl Rfm69 {
 		}
 		// at this point either CrcOk or PayloadReady should fire
 		let ready = self.get_payload_crc()?;
-		if let Err(e) = ready.check_and_wait(fifo_wait) { 
+		if let Err(_) = ready.check_and_wait(fifo_wait) { 
 			/* if the sync word and address didnt match we would have timed-out above so we dont need to check
 			   sync word interrupt.
 			 */ 
@@ -1089,14 +1088,6 @@ impl fmt::Display for PacketConfig {
 		write!(f, "{{ variable: {}, length: {} }}", self.is_variable(), self.len())
 	}
 
-}
-
-fn byte_to_binary(u: u8) {
-	for i in 0..8 {
-		let shift = 1 << i;
-		print!("{}", (u & shift) / shift);
-	}
-	println!("\n76543210");
 }
 
 impl Default for PacketConfig {

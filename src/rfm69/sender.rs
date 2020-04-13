@@ -1,8 +1,8 @@
 
-use crate::{bit,cond_set_bit,set_bit,Error,set_bit_to,sleep,unset_bit,ConfigMessage,Void};
-use crate::{PacketSender,NetworkPacketSender,AddressPacketReceiver,BroadcastPacketReceiver};
+use crate::{Error,ConfigMessage};
+use crate::{PacketSender,NetworkPacketSender};
 use crate::IntoPacketSender;
-use crate::rfm69::{SyncConfig,Rfm69,PacketConfig,DCFree,Filtering,Mode};
+use crate::rfm69::{SyncConfig,Rfm69,PacketConfig,DCFree,Mode};
 
 use reed_solomon::Encoder;
 use std::sync::mpsc::{channel,Sender};
