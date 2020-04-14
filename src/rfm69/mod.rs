@@ -131,7 +131,7 @@ impl Rfm69 {
 	/// let en = chip.get_line(3).unwrap();
 	/// let spidev = Spidev::open("/dev/spidev0.0").unwrap();
 	/// let rfm = Rfm69::new(rst, en, spidev).unwrap();
-	/// assert_eq!(0x24, rfm.get_version().unwrap());
+	/// assert_eq!(0x24, rfm.version().unwrap());
 	/// ```
 	pub fn new(rst: Line, en: Line, mut spi: Spidev) -> Result<Self, Error> {
 		let flags = LineRequestFlags::OUTPUT;
@@ -167,17 +167,23 @@ impl Rfm69 {
 	/// 
 	/// If the `Rfm69`'s mode is already in the given `mode` then this function does nothing.
 	/// After setting the mode on the device this method will wait up to 10 ms, before timing out.
+	/// The device starts in `Standby` mode.
+	///
+	/// This function changes [`OpMode`]  on the RFM69 chip.
+	///
+	/// [`Mode`]: ./enum.Mode.html
+	/// [`OpMode`]: ./enum.Register.html
 	pub fn set_mode(&mut self, mode: Mode) -> Result<(), Error> {
 		self.set_mode_internal(mode)?;
 		// wait for mode to be set
 		let iw = self.get_mode_ready()?;
 		iw.check_and_wait(Duration::from_millis(10))
 	}
-	/// Returns the [`Mode`] of the device.
+	/// Returns the [`Mode`] of the device stored by the controller.
 	///
 	/// The value returned is the `Mode` stored by the controller.
 	/// This could differ from the actual device's mode if an error has occurred or if the [`write()`]/[`write_many()`] methods are used directly are used directly.
-	/// [`mode_dev()`] will get the `Mode` from the device, instead of the stored mode.o
+	/// [`mode_dev()`] will get the `Mode` from the device, instead of the stored mode.
 	///
 	/// # Example 
 	/// ```
@@ -192,7 +198,6 @@ impl Rfm69 {
 	/// let rfm = Rfm69::new(rst, en, spidev).unwrap();
 	/// assert_eq!(rfm.mode(), Mode::Standby);
 	/// ```
-	///
 	/// [`Mode`]: ./enum.Mode.html
 	/// [`mode_dev()`]: ./struct.Rfm69.html#method.mode_dev
 	/// [`write()`]: ./struct.Rfm69.html#method.write
@@ -205,7 +210,19 @@ impl Rfm69 {
 	///
 	/// The value returned is the `Mode` stored on the actual device.
 	/// This is in contrast to [`mode()`] which gets the stored `Mode` from the controller.
-	/// 
+	///
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::{Rfm69,Mode};
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// assert_eq!(rfm.mode_dev().unwrap(), Mode::Standby);
+	/// ```
 	/// [`Mode`]: ./enum.Mode.html
 	/// [`mode()`]: ./struct.Rfm69.html#method.mode
 	#[inline]
@@ -213,15 +230,347 @@ impl Rfm69 {
 		let mode = self.read(Register::OpMode)? & 0x7F;
 		Ok(Mode::from_u8(mode).unwrap())
 	}
+	/// Sets the bitrate of the RFM69 device.
+	///
+	/// The RFM69 device will have better range at a lower. 
+	/// This function sets the [`BitrateMsb/Lsb`] registers.
+	/// This function returns `Err` if `bitrate` is out of range or on IO errors[`write()`]/[`write_many()`]
+	///
+	/// # Example 
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::Rfm69;
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// rfm.set_bitrate(50_000).unwrap(); // 50 kbps
+	/// assert_eq!(rfm.bitrate(), 50_000);
+	/// assert_eq!(rfm.bitrate_dev().unwrap(), 50_000);
+	/// ```
+	/// [`BitrateMsb/Lsb`]: ./enum.Register.html
+	/// [`write()`]: ./struct.Rfm69.html#method.write
+	/// [`write_many()`]:  ./struct.Rfm69.html#method.write_many
+	pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), Error> {
+		if bitrate > 300000 {
+			Err(Error::BadInputs("Bitrate out of bounds!".to_string()))
+		} else if let Ok(v) = ((FXOSC as f64 / bitrate as f64).round() as u64).try_into() {
+			let v: u16 = v;
+			self.write_many(Register::BitrateMsb, &v.to_be_bytes())?;
+			self.bitrate = bitrate;
+			Ok(())
+		} else {
+			Err(Error::BadInputs("Bitrate out of bounds!".to_string()))
+		}
+	}
+	/// Returns the bitrate of the device stored by the controller in bits per second.
+	///
+	/// The difference between this function and [`bitrate_dev()`] is this function returns a stored bitrate, while `bitrate_dev()` reads from the RFM69 chip and computes the bitrate.
+	/// This function is faster but may differ from the actual device bitrate if [`write()`]/[`write_many()`] are used.
+	/// # Example 
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::Rfm69;
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// assert_eq!(rfm.bitrate(), 4800); // 4.8 kpbs
+	/// ```
+	/// [`write()`]: ./struct.Rfm69.html#method.write
+	/// [`write_many()`]:  ./struct.Rfm69.html#method.write_many
+	/// [`bitrate_dev()`]: 
+	#[inline]
+	pub fn bitrate(&self) -> u32 {
+		self.bitrate
+	}
+	/// Returns the bitrate from the RFM69 chip in bits per second.
+	///
+	/// The difference between this function and [`bitrate()`] is this function returns the bitrate from the actual device, while `bitrate()` read a value stored by the controller.
+	/// Reads from the [`BitrateMsb/Lsb`] registers.
+	/// This function returns `Err` if there is an SPI IO error.
+	/// # Example 
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::Rfm69;
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// assert_eq!(rfm.bitrate_dev().unwrap(), 4800); // 4.8 kpbs
+	/// ```
+	/// [`BitrateMsb/Lsb`]: ./enum.Register.html
+	pub fn bitrate_dev(&self) -> Result<u32, Error> {
+		let mut v = [0, 0];	
+		self.read_many(Register::BitrateMsb, &mut v)?;
+		let v = u16::from_be_bytes(v);
+		let v = (FXOSC as f64 / v as f64).round() as u32;
+		Ok(v)
+	}
+	/// Sets the packet configuration of the RFM69 chip. 
+	///
+	/// `config` represents a variety of different options to configure the RFM69 chip.
+	/// Before writing the configuration to the device, the configuration is validated with [`PacketConfig::validate()`] to ensure make sure there are no conflicting options set.
+	/// By default these options are set to the [`Default`] implementation for `PacketConfig` values when the RFM69 controller is created.
+	/// These options are detailed more on the [`PacketConfig`] page.
+	/// This function sets the `PacketConfig1`, `PacketConfig2`, `PayloadLength`, `NodeAddrs`, `BroadcastAddrs`, and `FifoThresh` [`registers`].
+	/// This function returns `Err` if the configuration fails to validate or there is an SPI IO error.
+	/// # Example 
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::{Rfm69,PacketConfig};
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// let mut sc = PacketConfig::default();
+	/// sc.set_variable(true); // set the RFM69 chip the receive packets in variable format
+	/// sc.set_len(128); // set the maximum length of packets to be received.
+	/// rfm.set_config(&sc).unwrap();
+	/// assert_eq!(rfm.config(), sc);
+	/// assert_eq!(rfm.config_dev().unwrap(), sc);
+	/// ```
+	/// [`PacketConfig`]: ./struct.PacketConfig.html
+	/// [`Default`]: ./struct.PacketConfig.html#impl-Default
+	/// [`PacketConfig::validate()`]: ./struct.PacketConfig.html#method.validate
+	/// [`registers`]: ./enum.Register.html
+	pub fn set_config<T: AsRef<PacketConfig>>(&mut self, config: T) -> Result<(), Error> {
+		// validate config./struct.Rfm69.html#method.config
+		let config = config.as_ref();
+		config.validate()?;
 
+		self.write_many(Register::PacketConfig1, &config.0)?;
+		self.write_many(Register::FifoThresh, &config.1)?;
+		self.pc = *config;
+		Ok(())
+
+	}
+	/// Returns the packet configuration from the controller.
+	///
+	/// The difference between this function and [`config_dev()`] is this function returns the configuration stored by the controller, while the latter reads the configuration from the RFM69 chip.
+	/// This function is faster but may differ from the device configuration if [`write()`]/[`write_many()`] are used.
+	/// # Example 
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::{Rfm69,PacketConfig};
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// assert_eq!(rfm.config(), PacketConfig::default());
+	/// ```
+	/// 
+	/// [`write()`]: ./struct.Rfm69.html#method.write
+	/// [`write_many()`]:  ./struct.Rfm69.html#method.write_many
+	/// [`config_dev()`]: ./struct.Rfm69.html#method.config_dev 
+	pub fn config(&self) -> PacketConfig {
+		self.pc
+	}
+	/// Reads and returns the packet configuration from the RFM69 chip.
+	///
+	/// The difference between this function and [`config()`] is that this function reads the configuration for the actual device, while the latter returns the configuration stored by the controller.
+	/// This function reads the `PacketConfig1`, `PacketConfig2`, `PayloadLength`, `NodeAddrs`, `BroadcastAddrs`, and `FifoThresh` [`registers`].
+	/// This function returns `Err` if there is an SPI IO error.
+	///
+	/// # Example 
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::{Rfm69,PacketConfig};
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// assert_eq!(rfm.config_dev().unwrap(), PacketConfig::default());
+	/// ```
+	/// [`registers`]: ./enum.Register.html
+	/// [`config()`]: ./struct.Rfm69.html#method.config
+	pub fn config_dev(&self) -> Result<PacketConfig, Error> {
+		let mut packet1 = [0; 4];
+		self.read_many(Register::PacketConfig1, &mut packet1)?;
+		
+		let mut packet2 = [0, 0];
+		self.read_many(Register::FifoThresh, &mut packet2)?;
+		let pc = PacketConfig(packet1, packet2);	
+		Ok(pc)
+	}
+	/// Sets the sync word configuration of the RFM69 chip.
+	///
+	/// `config` represents the Sync word ocnfiguration used to tell which packets should be received by the Rfm69 chip.
+	/// By default, the sync word configuration is set to the values specified by the [`Default`] implementation for `SyncConfig` when the controller is created.
+	/// More information on sync word configuration options can be found on [`SyncConfig`] page.
+	/// This function sets the `SyncConfig`, and `SyncValue1-9` [`registers`] 
+	/// This function returns `Err` if there is an SPI IO error.
+	/// # Example 
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::{Rfm69,SyncConfig};
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// let sc = *SyncConfig::default().set_sync_word(&[0x56, 0xa9, 0x0b, 0x9a]).set_len(4); // this is the configuration used by the PacketReceiver/Sender impls
+	/// rfm.set_sync(sc).unwrap();
+	/// assert_eq!(rfm.sync(), sc);
+	/// assert_eq!(rfm.sync_dev().unwrap(), sc);
+	/// ```
+	/// 
+	/// [`SyncConfig`]: ./struct.SyncConfig.html
+	/// [`Default`]: ./struct.SyncConfig.html#impl-Default
+	/// [`registers`]: ./enum.Register.html
+	pub fn set_sync<T: AsRef<SyncConfig>>(&mut self, config: T) -> Result<(), Error> {
+		let config = config.as_ref();
+		self.write_many(Register::SyncConfig, &config.0)?;
+		self.sc = *config;
+		Ok(())
+	}
+	/// Returns the sync word configuration from the controller.
+	///
+	/// The difference between this function and [`sync_dev()`] is this function returns the configuration stored by the controller, while the latter reads the configuration from the RFM69 chip.
+	/// This function is faster but may differ from the actual device bitrate if [`write()`]/[`write_many()`] are used.
+	/// # Example
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::{Rfm69,SyncConfig};
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// assert_eq!(rfm.sync(), SyncConfig::default());
+	/// ```
+	/// 
+	/// [`write()`]: ./struct.Rfm69.html#method.write
+	/// [`write_many()`]:  ./struct.Rfm69.html#method.write_many
+	/// [`sync_dev()`]:  ./struct.Rfm69.html#method.sync_dev
+	#[inline]
+	pub fn sync(&self) -> SyncConfig {
+		self.sc
+	}
+	/// Reads and returns the sync word configuration from the RFM69 chip.
+	///
+	/// The difference between this function and [`sync()`] is this function reads the sync word configuration from the actual device, while the latter returns the configuration stored by the controller.
+	/// This function reads the `SyncConfig`, and `SyncValue1-9` [`registers`] 
+	/// This function returns `Err` if there is an SPI IO error.
+	///
+	/// # Example
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::{Rfm69,SyncConfig};
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// assert_eq!(rfm.sync_dev().unwrap(), SyncConfig::default());
+	/// ```
+
+	/// [`registers`]: ./enum.Register.html
+	/// [`sync()`]: ./struct.Rfm69.html#method.sync
+	pub fn sync_dev(&self) -> Result<SyncConfig, std::io::Error> {
+		let mut buf = [0; 9];
+		self.read_many(Register::SyncConfig, &mut buf)?;
+		Ok(SyncConfig(buf))
+	}
+
+	/// Sets the preamble length in bytes of the packets sent or received by the RFM69 chip
+	///
+	/// This function sets the [`PreambleMsb/Lsb`] on the device.
+	/// This function returns `Err` if there is an SPI IO error.
+	/// # Example 
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::Rfm69;
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// rfm.set_preamble_len(1024).unwrap();
+	/// assert_eq!(rfm.preamble_len(), 1024);
+	/// assert_eq!(rfm.preamble_len_dev().unwrap(), 1024);
+	/// ```
+	/// [`PreambleMsb/Lsb`]: ./enum.Register.html
 	pub fn set_preamble_len(&mut self, len: u16) -> Result<(), Error> {
 		self.write_many(Register::PreambleMsb, &len.to_be_bytes())?;
 		self.preamble = len;
 		Ok(())
 	}
+	/// Returns the preamble length in bytes of packets.
+	///
+	/// The difference between this function and [`preamble_len_dev()`] is this function returns the preamble length stored by the controller, while the latter reads the actual preamble length from the device.
+	/// This function is faster but may differ from the actual device if [`write()`]/[`write_many()`] are used.
+	///
+	/// # Example 
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::Rfm69;
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// assert_eq!(rfm.preamble_len(), 3);
+	/// ```
+	/// [`preamble_len_dev()`]: ./struct.Rfm69.html#method.preamble_len_dev
+	/// [`write()`]: ./struct.Rfm69.html#method.write
+	/// [`write_many()`]:  ./struct.Rfm69.html#method.write_many
+	#[inline]
 	pub fn preamble_len(&self) -> u16 {
 		self.preamble
 	}
+	/// Returns the preamble length in bytes of packet.
+	///
+	/// The difference between this function and [`preamble_len()`], is this function returns the preamble length from the actual device, while the latter returns the preamble length from a stored value by the controller.
+	/// This function returns `Err` if there is an SPI IO error.
+	/// # Example 
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::Rfm69;
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// assert_eq!(rfm.preamble_len_dev().unwrap(), 3);
+	/// ```
+	/// [`preamble_len()`]: ./struct.Rfm69.html#method.preamble_len
+	pub fn preamble_len_dev(&self) -> Result<u16, Error> {
+		let mut len = [0; 2];
+		self.read_many(Register::PreambleMsb, &mut len)?;
+		Ok(u16::from_be_bytes(len))
+	}
+
 	#[inline]
 	pub fn set_dio(&mut self, index: u8, line: Option<Line>) {
 		assert!(index < 6);
@@ -236,14 +585,6 @@ impl Rfm69 {
 	}
 	pub fn dios(&self) -> &[Option<Line>; 6] {
 		&self.dios
-	}
-	pub fn preamble_len_dev(&self) -> Result<u16, Error> {
-		let mut len = [0; 2];
-		self.read_many(Register::PreambleMsb, &mut len)?;
-		Ok(u16::from_be_bytes(len))
-	}
-	pub fn get_version(&self) -> Result<u8,std::io::Error> {
-		self.read(Register::Version)
 	}
 	pub fn configure_defaults(&mut self) -> Result<(), Error> {
 		self.set_config(&PacketConfig::default())?;
@@ -283,20 +624,12 @@ impl Rfm69 {
 		}
 		Ok(())
 	}
-	fn validate_version(&self) -> Result<(), Error> {
-		let version = self.get_version()?;
-		if version == 0x24 {
-			Ok(())
-		} else {
-			Err(Error::ChipMalfunction(format!("Version mismatch! expected 0x24, found {:#X}", version)))
-		}
-	}
 	pub fn read(&self, reg: Register) -> Result<u8, std::io::Error> {
 		let mut buf = [0];
 		self.read_many(reg, &mut buf)?;
 		Ok(buf[0])
 	}
-	fn read_many(&self, reg: Register, buf: &mut [u8]) -> Result<(), std::io::Error> {
+	pub fn read_many(&self, reg: Register, buf: &mut [u8]) -> Result<(), std::io::Error> {
 		let reg = [(reg as u8) & 0x7F];
 		let addr_xfer =  SpidevTransfer::write(&reg);
 		let read_xfer = SpidevTransfer::read(buf);
@@ -318,11 +651,11 @@ impl Rfm69 {
 		self.spi.transfer_multiple(&mut xfers)?;
 		if i_buf.len() != 0 { Err(Error::BufferOverflow(count)) } else { Ok(()) }
 	}
-	fn write(&self, reg: Register, val: u8) -> Result<(), std::io::Error> {
+	pub fn write(&self, reg: Register, val: u8) -> Result<(), std::io::Error> {
 		let buf = [val];
 		self.write_many(reg, &buf)
 	}
-	fn write_many(&self, reg: Register, buf: &[u8]) -> Result<(), std::io::Error> {
+	pub fn write_many(&self, reg: Register, buf: &[u8]) -> Result<(), std::io::Error> {
 		let reg = [(reg as u8) | 0x80];
 		let addr_xfer = SpidevTransfer::write(&reg);
 		let write_xfer = SpidevTransfer::write(buf);
@@ -340,27 +673,6 @@ impl Rfm69 {
 		let mut ret = [0; 0x4E];	
 		self.read_many(Register::OpMode, &mut ret)?;
 		Ok(ret)
-	}
-	pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), Error> {
-		if let Ok(v) = ((FXOSC as f64 / bitrate as f64).round() as u64).try_into() {
-			let v: u16 = v;
-			self.write_many(Register::BitrateMsb, &v.to_be_bytes())?;
-			self.bitrate = bitrate;
-			Ok(())
-		} else {
-			Err(Error::BadInputs("Bitrate out of bounds!".to_string()))
-		}
-	}
-	pub fn bitrate_dev(&self) -> Result<u32, std::io::Error> {
-		let mut v = [0, 0];	
-		self.read_many(Register::BitrateMsb, &mut v)?;
-		let v = u16::from_be_bytes(v);
-		let v = (FXOSC as f64 / v as f64).round() as u32;
-		Ok(v)
-	}
-	#[inline]
-	pub fn bitrate(&self) -> u32 {
-		self.bitrate
 	}
 	pub fn set_power(&self, power: i8) -> Result<(), Error> {
 		if power < -18 || power > 20 {
@@ -441,21 +753,6 @@ impl Rfm69 {
 		let ret = (v as f64 * FSTEP).round() as u32;
 		Ok(ret)
 	}
-	pub fn set_sync<T: AsRef<SyncConfig>>(&mut self, config: T) -> Result<(), Error> {
-		let config = config.as_ref();
-		self.write_many(Register::SyncConfig, &config.0)?;
-		self.sc = *config;
-		Ok(())
-	}
-	#[inline]
-	pub fn sync(&self) -> SyncConfig {
-		self.sc
-	}
-	pub fn sync_dev(&self) -> Result<SyncConfig, std::io::Error> {
-		let mut buf = [0; 9];
-		self.read_many(Register::SyncConfig, &mut buf)?;
-		Ok(SyncConfig(buf))
-	}
 	pub fn temp(&self) -> Result<i8, Error> {
 		self.write(Register::Temp1, 0x08)?;
 		for _ in 0..5 {
@@ -467,29 +764,6 @@ impl Rfm69 {
 			}
 		}
 		Err(Error::Timeout("Temperature reading timed out!".to_string()))
-	}
-	pub fn set_config<T: AsRef<PacketConfig>>(&mut self, config: T) -> Result<(), Error> {
-		// validate config
-		let config = config.as_ref();
-		config.validate()?;
-
-		self.write_many(Register::PacketConfig1, &config.0)?;
-		self.write_many(Register::FifoThresh, &config.1)?;
-		self.pc = *config;
-		Ok(())
-
-	}
-	pub fn config(&self) -> PacketConfig {
-		self.pc
-	}
-	pub fn config_dev(&self) -> Result<PacketConfig, Error> {
-		let mut packet1 = [0; 4];
-		self.read_many(Register::PacketConfig1, &mut packet1)?;
-		
-		let mut packet2 = [0, 0];
-		self.read_many(Register::FifoThresh, &mut packet2)?;
-		let pc = PacketConfig(packet1, packet2);	
-		Ok(pc)
 	}
 
 	fn get_fifo_not_empty(&self) -> Result<IrqWait, Error> {
@@ -825,9 +1099,55 @@ impl Rfm69 {
 		self.mode = mode;
 		Ok(())
 	}
+	/// Sets if the controller should write debug information to `stderr`.
+	///
+	/// By default `verbose` is false. This function has no affect on the actual operation of the RFm69 chip.
+	/// # Example 
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::Rfm69;
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// rfm.set_verbose(true); // defaults to false
+	/// ```
 	pub fn set_verbose(&mut self, verbose: bool) {
 		self.verbose = verbose
 	}
+	/// Reads and returns the version from the device.
+	///
+	/// This value is read from the [`Version`] register. The version should always be 0x24 (36).
+	/// # Example 
+	/// ```
+	/// # use gpio_cdev::Chip;
+	/// # use spidev::Spidev;
+	/// use ham::rfm69::Rfm69;
+	///
+	/// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+	/// # let rst = chip.get_line(24).unwrap();
+	/// # let en = chip.get_line(3).unwrap();
+	/// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+	/// let rfm = Rfm69::new(rst, en, spidev).unwrap();
+	/// assert_eq!(rfm.version().unwrap(), 0x24);
+	/// ```
+	/// [`Version`]: ./enum.Register.html
+	pub fn version(&self) -> Result<u8,std::io::Error> {
+		self.read(Register::Version)
+	}
+	fn validate_version(&self) -> Result<(), Error> {
+		let version = self.version()?;
+		if version == 0x24 {
+			Ok(())
+		} else {
+			Err(Error::ChipMalfunction(format!("Version mismatch! expected 0x24, found {:#X}", version)))
+		}
+	}
+
+
 }
 impl Drop for Rfm69 {
 	fn drop(&mut self) {
@@ -844,8 +1164,15 @@ impl Drop for Rfm69 {
 	}
 }
 
-
-
+/// The `Register` enum corresponds to the different registers present on the RFM69 chip.
+/// Some of these registers are used to configure the [`Rfm69`] controller to configure different function provided by the RFM69 chip.
+/// They can be manually read from using [`Rfm69::read()`]/[`Rfm69::read_many()`] and written to using [`Rfm69::write()`]/[`Rfm69::write_many()`]
+///
+/// [`Rfm69::write()`]: ./struct.Rfm69.html#method.write
+/// [`Rfm69::write_many()`]:  ./struct.Rfm69.html#method.write_many
+/// [`Rfm69::read()`]: ./struct.Rfm69.html#method.read
+/// [`Rfm69::read_many()`]:  ./struct.Rfm69.html#method.read_many
+/// [`Rfm69`]: ./struct.Rfm69.html
 #[derive(FromPrimitive,Clone,Copy,Debug)]
 pub enum Register {
     Fifo = 0x00,
@@ -1006,7 +1333,6 @@ impl SyncConfig {
 		self.0[0] = (self.0[0] & 0xF8) | error;
 		self
 	}
-
 }
 
 #[derive(Clone,Copy,PartialEq,Debug)]
@@ -1068,7 +1394,7 @@ impl PacketConfig {
 		self
 	}
 	#[inline]
-	pub fn start(&self) -> bool {
+	pub fn tx_start(&self) -> bool {
 		bit(self.1[0], 7)
 	}
 	#[inline]
@@ -1145,12 +1471,6 @@ impl PacketConfig {
 					}
 				}
 			}
-		}
-		if self.dc() == DCFree::Reserved {
-			return Err(Error::BadInputs("DC cannot be set to Reserved variant".to_string()))
-		}
-		if self.filtering() == Filtering::Reserved {
-			return Err(Error::BadInputs("Filtering cannot be set to Reserved variant".to_string()))
 		}
 		Ok(())
 	}

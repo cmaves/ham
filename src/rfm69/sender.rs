@@ -44,7 +44,6 @@ impl PacketSender for Rfm69PS {
 		vec.extend_from_slice(msg);
 		let encoded = self.encoder.encode(&vec[1..]);
 		vec.extend_from_slice(encoded.ecc());
-		eprintln!("sending message: {:02X?}", vec);
 		let vec = ConfigMessage::SendMessage(vec);
 		self.conf_sender.send(vec).map_err(|_| Error::Unrecoverable("Sending thread is disconnected!".to_string()))
 	}

@@ -129,7 +129,6 @@ fn send_recv_variable() {
 			let mut recvd = [0; 255];
 			let len = rfm1.recv(&mut recvd[..i], Duration::from_secs(5)).unwrap();
 			rfm1.set_mode(Mode::Standby).unwrap();
-			eprintln!("Rssi: {}", rfm1.rssi().unwrap());
 			assert_eq!(len,i);
 			assert_eq!(recvd[..i],cpy[..i]);
 			rfm1
@@ -235,7 +234,8 @@ fn packetreceiver_sender() {
 				Ok((recvd, _)) => {
 					assert_eq!(recvd[..i],cpy[..i]);
 					let cur_time = receiver.cur_time().unwrap();
-					assert!(cur_time  >= time && cur_time <= time + 1_000_000);
+					assert!(cur_time  >= time);
+					assert!(cur_time <= time + 5_000_000);
 					receiver.terminate().ok().unwrap().into_packet_receiver().unwrap()
 				},
 				Err(e) => panic!("Error {:?}, getting error from thread: {:?}", e, receiver.terminate().map_err(|(e, _)| e).err().unwrap()),
@@ -252,7 +252,7 @@ fn packetreceiver_sender() {
 		}
 		receiver = match recv.join() { // check if other thread panicked
 			Ok(v) => v,
-			Err(e) => {
+			Err(_) => {
 				// the other thread will panic if sending thread didnt succeed. It is more useful to get this error message
 				if let Err(_) = sender.alive() {
 					panic!("Receive thread disconnected, getting error: {:02?}", sender.terminate().map_err(|(e, _)| e).err().unwrap());
