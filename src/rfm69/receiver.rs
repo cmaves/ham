@@ -66,14 +66,14 @@ fn message(
             Ok(false)
         }
         ConfigMessage::SetAddr(addr) => {
-            let pc = *(rfm.config().set_address(addr));
+            let pc = rfm.config().set_address(addr);
             if pc != rfm.config() {
                 rfm.set_config(pc)?;
             }
             Ok(false)
         }
         ConfigMessage::SetBroadcast(addr) => {
-            let pc = *(rfm.config().set_broadcast(addr));
+            let pc = rfm.config().set_broadcast(addr);
             if pc != rfm.config() {
                 rfm.set_config(pc)?;
             }
@@ -122,7 +122,7 @@ impl IntoPacketReceiver for Rfm69 {
         let rfm_thread = builder.spawn(move ||{
 			let clock = clock_clone;
 			let mut init_dev = ||{
-				let pc = *PacketConfig::default().set_variable(true).set_len(255).set_crc(false).set_dc(DCFree::Whitening);
+				let pc = PacketConfig::default().set_variable(true).set_len(255).set_crc(false).set_dc(DCFree::Whitening);
 				self.set_config(pc)?;
 				let sc = *SyncConfig::default().set_sync_word(&[0x56, 0xa9, 0x0b, 0x9a]).set_len(4);
 				self.set_sync(sc)?;

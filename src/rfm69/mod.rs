@@ -8,6 +8,7 @@ use reed_solomon::Decoder;
 use spidev::{SpiModeFlags, Spidev, SpidevOptions, SpidevTransfer};
 use std::convert::TryInto;
 use std::fmt;
+use std::ops::Index;
 use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -26,7 +27,7 @@ pub struct Rfm69 {
     pc: PacketConfig,
     sc: SyncConfig,
     mode: Mode,
-    dio_maps: [u8; 6],
+    dio_map: DioMapping,
     fifo_thresh: u8,
     bitrate: u32,
     preamble: u16,
@@ -173,7 +174,7 @@ impl Rfm69 {
             preamble: 0x03,
             pc: PacketConfig::default(),
             mode: Mode::Standby,
-            dio_maps: [0; 6],
+            dio_map: DioMapping::default(),
             fifo_thresh: 15,
             sc: SyncConfig::default(),
         };
@@ -379,25 +380,23 @@ impl Rfm69 {
     /// # let en = chip.get_line(3).unwrap();
     /// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
     /// let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
-    /// let mut sc = PacketConfig::default();
-    /// sc.set_variable(true); // set the RFM69 chip the receive packets in variable format
-    /// sc.set_len(128); // set the maximum length of packets to be received.
-    /// rfm.set_config(&sc).unwrap();
-    /// assert_eq!(rfm.config(), sc);
-    /// assert_eq!(rfm.config_dev().unwrap(), sc);
+    /// let mut pc = PacketConfig::default();
+    /// pc = pc.set_variable(true); // set the RFM69 chip the receive packets in variable format
+    /// pc = pc.set_len(128); // set the maximum length of packets to be received.
+    /// rfm.set_config(pc).unwrap();
+    /// assert_eq!(rfm.config(), pc);
+    /// assert_eq!(rfm.config_dev().unwrap(), pc);
     /// ```
     /// [`PacketConfig`]: ./struct.PacketConfig.html
     /// [`Default`]: ./struct.PacketConfig.html#impl-Default
     /// [`PacketConfig::validate()`]: ./struct.PacketConfig.html#method.validate
     /// [`registers`]: ./enum.Register.html
-    pub fn set_config<T: AsRef<PacketConfig>>(&mut self, config: T) -> Result<(), Error> {
+    pub fn set_config(&mut self, config: PacketConfig) -> Result<(), Error> {
         // validate config./struct.Rfm69.html#method.config
-        let config = config.as_ref();
         config.validate()?;
-
         self.write_many(Register::PacketConfig1, &config.0)?;
         self.write_many(Register::FifoThresh, &config.1)?;
-        self.pc = *config;
+        self.pc = config;
         Ok(())
     }
     /// Returns the packet configuration from the controller.
@@ -531,7 +530,6 @@ impl Rfm69 {
     /// let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
     /// assert_eq!(rfm.sync_dev().unwrap(), SyncConfig::default());
     /// ```
-
     /// [`registers`]: ./enum.Register.html
     /// [`sync()`]: ./struct.Rfm69.html#method.sync
     pub fn sync_dev(&self) -> Result<SyncConfig, std::io::Error> {
@@ -539,7 +537,31 @@ impl Rfm69 {
         self.read_many(Register::SyncConfig, &mut buf)?;
         Ok(SyncConfig(buf))
     }
-
+    /// Sets the AES key to be used when sending or receiving packets.
+    ///
+    /// This method only sets the AES key; it does not enable AES encryption/decryption.
+    /// It can be enabled with [`set_config()`].
+    /// This function set the [`AesKey1-16`] registers.
+    /// This function returns `Err` if there is an SPI IO error.
+    /// [`set_config()`]:
+    /// [`AesKey1-16`]:
+    /// # Example
+    /// ```
+    /// # use gpio_cdev::Chip;
+    /// # use spidev::Spidev;
+    /// use ham::rfm69::{Rfm69};
+    ///
+    /// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+    /// # let rst = chip.get_line(24).unwrap();
+    /// # let en = chip.get_line(3).unwrap();
+    /// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+    /// let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
+    /// ```
+    /// [`set_config()`]: ./struct.Rfm69.html#method.set_config
+    /// [`AesKey1-16`]: ./enum.Register.html
+    pub fn set_aes(&self, key: &[u8; 16]) -> Result<(), std::io::Error> {
+        self.write_many(Register::AesKey1, key)
+    }
     /// Sets the preamble length in bytes of the packets sent or received by the RFM69 chip
     ///
     /// This function sets the [`PreambleMsb/Lsb`] on the device.
@@ -613,25 +635,134 @@ impl Rfm69 {
         self.read_many(Register::PreambleMsb, &mut len)?;
         Ok(u16::from_be_bytes(len))
     }
-
+    /// Adds or removes Gpio lines to correspond to the different DIO pins.
+    ///
+    /// The RFM69 chip has 6 DIO pins that provide various configurable interrupts.
+    /// If `dios` is shorter than 6 elements, then only the first lines are overwritten while the remaining remain intact.
+    /// If `dios` is longer than 6 elements, then the remainging elements after the first 6 are ignored.
+    /// This controller can operate without using any DIO pins by repeatingly querying the device over SPI for the status of certain interrupts.
+    /// Adding them may improve CPU usage by eliminating busy waiting for certain operations.
+    ///
+    /// # Example
+    /// ```
+    /// use gpio_cdev::Chip;
+    /// use spidev::Spidev;
+    /// use ham::rfm69::{Rfm69};
+    ///
+    /// let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+    /// let rst = chip.get_line(24).unwrap();
+    /// let en = chip.get_line(3).unwrap();
+    /// let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+    /// let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
+    /// let d0 = chip.get_line(17).unwrap();
+    /// let d1 = chip.get_line(27).unwrap();
+    /// rfm.set_dios(&[Some(d0), Some(d1)]);
+    /// ```
     #[inline]
-    pub fn set_dio(&mut self, index: u8, line: Option<Line>) {
-        assert!(index < 6);
-        self.dios[index as usize] = line;
-    }
-    #[inline]
-    pub fn set_dios(&mut self, lines: &[Option<Line>]) {
-        for (dst, src) in self.dios.iter_mut().zip(lines.iter()) {
+    pub fn set_dios(&mut self, dios: &[Option<Line>]) {
+        for (dst, src) in self.dios.iter_mut().zip(dios.iter()) {
             *dst = src.clone();
         }
     }
+    /// Adds or removes GPIO lines that correspond to the different DIO pins.
+    ///
+    /// The RFM69 chip has 6 DIO pins that provide various configurable interrupts.
+    /// This controller can operate without using any DIO pins by repeatingly querying the device over SPI for the status of certain interrupts.
+    /// Adding them may improve CPU usage by eliminating busy waiting for certain operations.
+    ///
+    /// # Example
+    /// ```
+    /// use gpio_cdev::Chip;
+    /// use spidev::Spidev;
+    /// use ham::rfm69::{Rfm69};
+    ///
+    /// let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+    /// let rst = chip.get_line(24).unwrap();
+    /// let en = chip.get_line(3).unwrap();
+    /// let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+    /// let mut rfm = Rfm69::new(rst, en, spidev).unwrap();
+    /// let d0 = chip.get_line(17).unwrap();
+    /// rfm.set_dio(0, Some(d0)); // set the DIO pin zero
+    /// ```
+    /// # Panics
+    /// This function will panic if `index` is greater than or equal to 6.
+    #[inline]
+    pub fn set_dio(&mut self, index: u8, dio: Option<Line>) {
+        self.dios[index as usize] = dio.clone();
+    }
+    #[inline]
     pub fn dios(&self) -> &[Option<Line>; 6] {
         &self.dios
     }
-    pub fn configure_defaults(&mut self) -> Result<(), Error> {
-        self.set_config(&PacketConfig::default())?;
-        self.set_sync(&SyncConfig::default())
+    #[inline]
+    pub fn set_dio_mapping(&mut self, dio_map: DioMapping) -> Result<(), Error> {
+        let bytes: [u8; 2] = dio_map.into();
+        self.write_many(Register::DioMapping1, &bytes)?;
+        self.dio_map = dio_map;
+        Ok(())
     }
+    #[inline]
+    pub fn dio_mapping(&self) -> DioMapping {
+        self.dio_map
+    }
+    #[inline]
+    pub fn dio_mapping_dev(&self) -> Result<DioMapping, Error> {
+        let mut bytes = [0; 2];
+        self.read_many(Register::DioMapping1, &mut bytes)?;
+        Ok(bytes.into())
+    }
+    /// Configures the RFM69 chip its recommended default settings.
+    ///
+    /// The method is called by new() during initialization.
+    /// This method the [`PacketConfig`], [`SyncConfig`], and [`DioMapping`] to their [`Default`] values.
+    /// # Example
+    /// ```
+    /// # use gpio_cdev::Chip;
+    /// # use spidev::Spidev;
+    /// use ham::rfm69::{Rfm69,PacketConfig};
+    ///
+    /// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+    /// # let rst = chip.get_line(24).unwrap();
+    /// # let en = chip.get_line(3).unwrap();
+    /// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+    /// let mut rfm = Rfm69::new(rst, en, spidev).unwrap().reset().unwrap();
+    /// assert_eq!(rfm.config_dev().unwrap(), PacketConfig::rst_value());
+    /// rfm.configure_defaults().unwrap();
+    /// assert_eq!(rfm.config_dev().unwrap(), PacketConfig::default());
+    /// ```
+
+    /// [`PacketConfig`]: ./struct.PacketConfig.html
+    /// [`SyncConfig`]: ./struct.SyncConfig.html
+    /// [`DioMapping`]: ./struct.DioMapping.html
+    /// [`Default`]: https://doc.rust-lang.org/nightly/core/default/trait.Default.html
+    pub fn configure_defaults(&mut self) -> Result<(), Error> {
+        self.set_config(PacketConfig::default())?;
+        self.set_sync(&SyncConfig::default())?;
+        self.set_dio_mapping(DioMapping::default())
+    }
+    /// Resets the RFM69 chip using the RST pin, and then performs simple validations on the chip.
+    ///
+    /// Resetting the RFM69 chip clears every register on the device, and resets them to their built-in reset values.
+    /// It is important to note that these values differ from the default values set by [`Rfm69::new()`] .
+    /// When `new()` is called it configures the Rfm69 chip to recommended defaults provided by the `default` methods for the different configuration structs.
+    /// This method is the easiest way to restore the built-in reset values.
+    /// This function will return `Err` if the device version fails to validate after the reset or if the `Mode` is not reset to `Standby`.
+    /// # Example
+    /// ```
+    /// # use gpio_cdev::Chip;
+    /// # use spidev::Spidev;
+    /// use ham::rfm69::{Rfm69,PacketConfig};
+    ///
+    /// # let mut chip = Chip::new("/dev/gpiochip0").unwrap();
+    /// # let rst = chip.get_line(24).unwrap();
+    /// # let en = chip.get_line(3).unwrap();
+    /// # let spidev = Spidev::open("/dev/spidev0.0").unwrap();
+    /// let rfm = Rfm69::new(rst, en, spidev).unwrap();
+    /// assert_eq!(rfm.config_dev().unwrap(), PacketConfig::default()); // config is set to recommended values
+    /// let rfm = rfm.reset().unwrap(); // Reset the chip
+    /// assert_eq!(rfm.config_dev().unwrap(), PacketConfig::rst_value()); // config is now set to reset values
+    /// ```
+    /// [`Rfm69::new()`]: ./struct.Rfm69.html#method.new
     pub fn reset(mut self) -> Result<Self, Error> {
         self.rst.set_value(1)?;
         sleep(Duration::from_millis(1));
@@ -640,6 +771,7 @@ impl Rfm69 {
         self.mode = Mode::Standby;
         self.bitrate = 4800;
         self.fifo_thresh = 15;
+        self.pc = PacketConfig::rst_value();
         self.validate_version()?;
         self.get_mode_ready()?
             .check_and_wait(Duration::from_millis(10))?;
@@ -725,9 +857,6 @@ impl Rfm69 {
     }
     pub fn rssi(&self) -> Result<f32, std::io::Error> {
         Ok(self.read(Register::RssiValue)? as f32 / -2.0)
-    }
-    pub fn aes(&self, key: &[u8; 16]) -> Result<(), std::io::Error> {
-        self.write_many(Register::AesKey1, key)
     }
     pub fn read_all(&self) -> Result<[u8; 0x4E], std::io::Error> {
         let mut ret = [0; 0x4E];
@@ -830,7 +959,7 @@ impl Rfm69 {
             check,
         };
         if let Some(line) = &self.dios[0] {
-            if self.dio_maps[1] == 2 {
+            if self.dio_map.map(1) == 2 {
                 let leh = line.events(
                     LineRequestFlags::INPUT,
                     EventRequestFlags::RISING_EDGE,
@@ -841,7 +970,7 @@ impl Rfm69 {
             }
         }
         if let Some(line) = &self.dios[2] {
-            if self.dio_maps[2] == 0 {
+            if self.dio_map.map(2) == 0 {
                 let leh = line.events(
                     LineRequestFlags::INPUT,
                     EventRequestFlags::RISING_EDGE,
@@ -874,7 +1003,7 @@ impl Rfm69 {
             check,
         };
         if let Some(line) = &self.dios[0] {
-            if self.mode == Mode::Tx && self.dio_maps[0] == 0 {
+            if self.mode == Mode::Tx && self.dio_map.map(0) == 0 {
                 let leh = line.events(
                     LineRequestFlags::INPUT,
                     EventRequestFlags::RISING_EDGE,
@@ -896,7 +1025,7 @@ impl Rfm69 {
         };
         if let Some(line) = &self.dios[0] {
             if self.mode == Mode::Rx
-                && ((self.pc.crc() && self.dio_maps[0] == 0) || (self.dio_maps[0] == 1))
+                && ((self.pc.crc() && self.dio_map.map(0) == 0) || (self.dio_map.map(0) == 1))
             {
                 let leh = line.events(
                     LineRequestFlags::INPUT,
@@ -921,7 +1050,7 @@ impl Rfm69 {
             check,
         };
         if let Some(line) = &self.dios[0] {
-            if self.mode == Mode::Rx && self.dio_maps[0] == 1 {
+            if self.mode == Mode::Rx && self.dio_map.map(0) == 1 {
                 let leh = line.events(
                     LineRequestFlags::INPUT,
                     EventRequestFlags::RISING_EDGE,
@@ -943,7 +1072,7 @@ impl Rfm69 {
             check,
         };
         if let Some(line) = &self.dios[1] {
-            if self.dio_maps[1] == 0 {
+            if self.dio_map.map(1) == 0 {
                 let leh = line.events(
                     LineRequestFlags::INPUT,
                     EventRequestFlags::FALLING_EDGE,
@@ -954,7 +1083,7 @@ impl Rfm69 {
             }
         }
         if let Some(line) = &self.dios[3] {
-            if self.dio_maps[3] == 0 {
+            if self.dio_map.map(3) == 0 {
                 let leh = line.events(
                     LineRequestFlags::INPUT,
                     EventRequestFlags::FALLING_EDGE,
@@ -976,7 +1105,7 @@ impl Rfm69 {
             check,
         };
         if let Some(line) = &self.dios[4] {
-            if self.mode == Mode::Tx && self.dio_maps[4] == 0 {
+            if self.mode == Mode::Tx && self.dio_map.map(4) == 0 {
                 let leh = line.events(
                     LineRequestFlags::INPUT,
                     EventRequestFlags::RISING_EDGE,
@@ -987,7 +1116,7 @@ impl Rfm69 {
             }
         }
         if let Some(line) = &self.dios[5] {
-            if self.dio_maps[5] == 3 {
+            if self.dio_map.map(5) == 3 {
                 let leh = line.events(
                     LineRequestFlags::INPUT,
                     EventRequestFlags::RISING_EDGE,
@@ -1009,7 +1138,7 @@ impl Rfm69 {
             check,
         };
         if let Some(line) = &self.dios[0] {
-            if self.mode == Mode::Rx && self.dio_maps[0] == 0x2 {
+            if self.mode == Mode::Rx && self.dio_map.map(0) == 0x2 {
                 let leh = line.events(
                     LineRequestFlags::INPUT,
                     EventRequestFlags::RISING_EDGE,
@@ -1020,7 +1149,7 @@ impl Rfm69 {
             }
         }
         if let Some(line) = &self.dios[3] {
-            if self.mode == Mode::Rx && self.dio_maps[3] == 0x2 {
+            if self.mode == Mode::Rx && self.dio_map.map(3) == 0x2 {
                 let leh = line.events(
                     LineRequestFlags::INPUT,
                     EventRequestFlags::RISING_EDGE,
@@ -1114,14 +1243,10 @@ impl Rfm69 {
     }
     fn fifo_read(&self, buf: &mut [u8], count: u8, timeout: Duration) -> Result<(), Error> {
         let count = count as usize;
-        #[cfg(test)]
-        eprintln!("fifo_read(): {}", count);
         // wait for the byte to be received
         let fifo = self.get_fifo_not_empty()?;
         fifo.check_and_wait(timeout)?;
 
-        // loop bytes
-        eprintln!("reception started");
         let fifo_wait = Duration::from_secs_f64(160.0 / self.bitrate as f64); // 80.0 comes from 8 bits in and a byte x10
         for i in 0..(count - 1) {
             if let Err(e) = fifo.check_and_wait(fifo_wait) {
@@ -1366,7 +1491,7 @@ impl Drop for Rfm69 {
 /// [`Rfm69::read()`]: ./struct.Rfm69.html#method.read
 /// [`Rfm69::read_many()`]:  ./struct.Rfm69.html#method.read_many
 /// [`Rfm69`]: ./struct.Rfm69.html
-#[derive(FromPrimitive, Clone, Copy, Debug)]
+#[derive(FromPrimitive, Clone, Copy, Debug, PartialEq)]
 pub enum Register {
     Fifo = 0x00,
     OpMode = 0x01,
@@ -1533,16 +1658,20 @@ pub struct PacketConfig([u8; 4], [u8; 2]);
 
 impl PacketConfig {
     #[inline]
+    pub fn rst_value() -> Self {
+        PacketConfig([0x10, 0x40, 0x00, 0x00], [0x0F, 0x02])
+    }
+    #[inline]
     pub fn is_variable(&self) -> bool {
         bit(self.0[0], 7)
     }
     #[inline]
-    pub fn set_variable(&mut self, val: bool) -> &mut Self {
+    pub fn set_variable(mut self, val: bool) -> Self {
         self.0[0] = set_bit_to(self.0[0], 7, val);
         self
     }
     #[inline]
-    pub fn set_unlimited(&mut self) -> &mut Self {
+    pub fn set_unlimited(mut self) -> Self {
         self.0[0] = unset_bit(self.0[0], 7);
         self.0[1] = 1;
         self
@@ -1560,7 +1689,7 @@ impl PacketConfig {
         self.0[1]
     }
     #[inline]
-    pub fn set_len(&mut self, len: u8) -> &mut Self {
+    pub fn set_len(mut self, len: u8) -> Self {
         self.0[1] = len;
         self
     }
@@ -1581,7 +1710,7 @@ impl PacketConfig {
         (self.1[0] >> 1) & 0x7F
     }
     #[inline]
-    pub fn set_threshold(&mut self, threshold: u8) -> &mut Self {
+    pub fn set_threshold(mut self, threshold: u8) -> Self {
         assert!(threshold < 0x80);
         self.1[0] = (self.1[0] & 0xF0) | threshold;
         self
@@ -1595,7 +1724,7 @@ impl PacketConfig {
         Filtering::from_u8((self.0[0] >> 1) & 0x03).unwrap()
     }
     #[inline]
-    pub fn set_filtering(&mut self, filtering: Filtering) -> &mut Self {
+    pub fn set_filtering(mut self, filtering: Filtering) -> Self {
         assert_ne!(filtering, Filtering::Reserved);
         self.0[0] = (self.0[0] & 0xF9) | ((filtering as u8) << 1);
         self
@@ -1605,7 +1734,7 @@ impl PacketConfig {
         bit(self.0[0], 3)
     }
     #[inline]
-    pub fn set_clear(&mut self, val: bool) -> &mut Self {
+    pub fn set_clear(mut self, val: bool) -> Self {
         self.0[0] = set_bit_to(self.0[0], 3, val);
         self
     }
@@ -1614,7 +1743,7 @@ impl PacketConfig {
         bit(self.0[0], 4)
     }
     #[inline]
-    pub fn set_crc(&mut self, val: bool) -> &mut Self {
+    pub fn set_crc(mut self, val: bool) -> Self {
         self.0[0] = set_bit_to(self.0[0], 4, val);
         self
     }
@@ -1623,7 +1752,7 @@ impl PacketConfig {
         DCFree::from_u8((self.0[0] >> 5) & 0x03).unwrap()
     }
     #[inline]
-    pub fn set_dc(&mut self, dc: DCFree) -> &mut Self {
+    pub fn set_dc(mut self, dc: DCFree) -> Self {
         assert_ne!(dc, DCFree::Reserved);
         self.0[0] = (self.0[0] & 0x9F) | ((dc as u8) << 5);
         self
@@ -1633,7 +1762,7 @@ impl PacketConfig {
         self.0[2]
     }
     #[inline]
-    pub fn set_address(&mut self, addr: u8) -> &mut Self {
+    pub fn set_address(mut self, addr: u8) -> Self {
         self.0[2] = addr;
         self
     }
@@ -1642,7 +1771,7 @@ impl PacketConfig {
         self.0[3]
     }
     #[inline]
-    pub fn set_broadcast(&mut self, addr: u8) -> &mut Self {
+    pub fn set_broadcast(mut self, addr: u8) -> Self {
         self.0[3] = addr;
         self
     }
@@ -1670,11 +1799,7 @@ impl PacketConfig {
         Ok(())
     }
 }
-impl AsRef<PacketConfig> for PacketConfig {
-    fn as_ref(&self) -> &PacketConfig {
-        self
-    }
-}
+
 impl fmt::Display for PacketConfig {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
@@ -1689,6 +1814,73 @@ impl fmt::Display for PacketConfig {
 impl Default for PacketConfig {
     fn default() -> Self {
         PacketConfig([0x10, 0x40, 0x00, 0x00], [0x8F, 0x02])
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct DioMapping(u16);
+impl Default for DioMapping {
+    fn default() -> Self {
+        DioMapping(0x0007)
+    }
+}
+
+impl DioMapping {
+    #[inline]
+    pub fn dio_map(&self) -> [u8; 6] {
+        let mut ret = [0; 6];
+        for (i, map) in ret.iter_mut().enumerate() {
+            *map = ((self.0 >> ((5 - i) + 4)) & 0x3) as u8;
+        }
+        ret
+    }
+    #[inline]
+    pub fn set_maps(mut self, maps: &[u8]) -> Self {
+        assert!(maps.len() <= 6);
+        assert_eq!(maps.iter().position(|x| *x >= 4), None);
+        // zero the bits that are changing with a mask
+        self.0 &= (0xFFF0_u16 << (maps.len() * 2)).reverse_bits();
+        for (i, map) in maps.iter().enumerate() {
+            self.0 |= (*map as u16) << (i * 2 + 4);
+        }
+        self
+    }
+    #[inline]
+    pub fn clkout(&self) -> u8 {
+        (self.0 as u8) & 0x07
+    }
+    #[inline]
+    pub fn set_clkout(mut self, clkout: u8) -> Self {
+        assert!(clkout < 8);
+        self.0 &= 0xFFF8;
+        self.0 |= clkout as u16;
+        self
+    }
+    #[inline]
+    pub fn map(&self, index: u8) -> u8 {
+        assert!(index < 6);
+        (self.0 >> ((5 - index) + 4)) as u8
+    }
+    #[inline]
+    pub fn set_map(mut self, index: u8, map: u8) -> Self {
+        assert!(index < 6);
+        assert!(map < 4);
+        self.0 &= 0xFFFC_u16.rotate_left((5 - index as u32) * 2 + 4); // zero target
+        self.0 |= (map as u16) << ((5 - index) * 2 + 4);
+        self
+    }
+}
+
+impl From<DioMapping> for [u8; 2] {
+    #[inline]
+    fn from(dio_map: DioMapping) -> Self {
+        dio_map.0.to_be_bytes()
+    }
+}
+impl From<[u8; 2]> for DioMapping {
+    #[inline]
+    fn from(bytes: [u8; 2]) -> Self {
+        DioMapping(u16::from_be_bytes(bytes))
     }
 }
 
