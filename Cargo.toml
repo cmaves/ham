@@ -1,5 +1,6 @@
 [package]
 name = "ham"
+description = "A crate with interfaces for small packet radios, with an implementation for RFM69."
 version = "0.1.0"
 authors = ["Curtis Maves <curtismaves@gmail.com>"]
 edition = "2018"
