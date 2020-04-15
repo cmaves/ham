@@ -3,6 +3,9 @@ name = "ham"
 version = "0.1.0"
 authors = ["Curtis Maves <curtismaves@gmail.com>"]
 edition = "2018"
+license = "MIT"
+license-file = "LICENSE"
+repository = "https://github.com/cmaves/ham/"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
