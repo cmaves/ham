@@ -259,8 +259,7 @@ fn packetreceiver_sender() {
                 Ok((recvd, _)) => {
                     assert_eq!(recvd[..i], cpy[..i]);
                     let cur_time = receiver.cur_time().unwrap();
-                    assert!(cur_time >= time);
-                    assert!(cur_time <= time + 5_000_000);
+                    assert!(cur_time.wrapping_sub(time) <= 5_000_000);
                     receiver
                         .terminate()
                         .ok()
