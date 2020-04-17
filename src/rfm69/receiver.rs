@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 pub struct Rfm69PR {
     rfm_thread: JoinHandle<Result<Rfm69, (Error, Rfm69)>>,
     conf_sender: SyncSender<ConfigMessage<[u8; 4], u8>>,
-    msg_recv: Receiver<(Vec<u8>, Address)>,
-    clock: Arc<RwLock<(Instant, u32)>>,
+    msg_recv: Receiver<(Vec<u8>, Address, Instant, u32)>,
+    clock_instant: Instant,
+    clock_time: u32,
     started: bool,
     verbose: bool,
 }
@@ -116,11 +117,8 @@ impl IntoPacketReceiver for Rfm69 {
         self.set_mode_internal(Mode::Standby)?;
         let (conf_sender, conf_recv) = sync_channel(0);
         let (msg_sender, msg_recv) = channel();
-        let clock = Arc::new(RwLock::new((Instant::now(), 0)));
-        let clock_clone = clock.clone();
         let builder = ThreadBuilder::new().name("rfm69_sender".to_string());
         let rfm_thread = builder.spawn(move ||{
-			let clock = clock_clone;
 			let mut init_dev = ||{
 				let pc = PacketConfig::default().set_variable(true).set_len(255).set_crc(false).set_dc(DCFree::Whitening);
 				self.set_config(pc)?;
@@ -173,27 +171,21 @@ impl IntoPacketReceiver for Rfm69 {
 							if let Ok(buf) =  decoder.correct(&data, None) {
 								let buf = buf.data();
 								let mut time = [0; 4];
-								time.copy_from_slice(&buf[0..4]);
+								time.copy_from_slice(&buf[1..5]);
 								let time = u32::from_be_bytes(time);
 								let mut vec = Vec::new();
+								vec.extend_from_slice(&buf[5..]);
 								let t = match self.pc.filtering() {
 									Filtering::None => {
-										vec.extend_from_slice(&buf[4..]);
 										Address::None
 									},
 									Filtering::Address|Filtering::Both => {
-										vec.extend_from_slice(&buf[5..]);
 										if buf[0] == self.pc.address() { Address::Address } else { Address::Broadcast }
 									},
 									_ => unreachable!()
 								};
-								if let Err(_) = msg_sender.send((vec, t)) {
+								if let Err(_) = msg_sender.send((vec, t, start, time)) {
 									return Err((Error::Unrecoverable("Reader thread: Receiver Message is disconnected".to_string()), self));
-								}
-								if let Ok(mut lock) = clock.write() {
-									*lock = (start, time);
-								} else {
-									return Err((Error::Unrecoverable("Reader thread: Clock lock is poisoned!".to_string()), self));
 								}
 							} else {
 								if verbose { eprintln!("Message received, but bad decode occurred!: {:X?}", data); }
@@ -207,7 +199,8 @@ impl IntoPacketReceiver for Rfm69 {
             rfm_thread,
             conf_sender,
             msg_recv,
-            clock,
+            clock_instant: Instant::now(),
+            clock_time: 0,
             started: false,
             verbose: false,
         })
@@ -215,27 +208,37 @@ impl IntoPacketReceiver for Rfm69 {
 }
 
 impl PacketReceiver for Rfm69PR {
-    fn cur_time(&self) -> Result<u32, Error> {
-        let time = self.clock.read().map_err(|_| {
-            Error::Unrecoverable("Packet receiver poisoned the clock lock!".to_string())
-        })?;
-        let diff = Instant::now().duration_since(time.0).as_micros() as u32;
-        Ok(diff.wrapping_add(time.1))
+    #[inline]
+    fn cur_time(&self) -> u32 {
+        let diff = Instant::now()
+            .duration_since(self.clock_instant)
+            .as_micros() as u32;
+        diff.wrapping_add(self.clock_time)
+    }
+    #[inline]
+    fn last_time(&self) -> u32 {
+        self.clock_time
     }
     fn recv_packet(&mut self) -> Result<(Vec<u8>, Address), Error> {
         assert!(self.started);
-        self.msg_recv.recv().map_err(|_| {
+        let (msg, addr, inst, time) = self.msg_recv.recv().map_err(|_| {
             Error::Unrecoverable("Packet receiver thread is disconnected!".to_string())
-        })
+        })?;
+        self.clock_instant = inst;
+        self.clock_time = time;
+        Ok((msg, addr))
     }
     fn recv_packet_timeout(&mut self, timeout: Duration) -> Result<(Vec<u8>, Address), Error> {
         assert!(self.started);
-        self.msg_recv.recv_timeout(timeout).map_err(|e| match e {
+        let (msg, addr, inst, time) = self.msg_recv.recv_timeout(timeout).map_err(|e| match e {
             RecvTimeoutError::Timeout => Error::Timeout("Packet reception timed out.".to_string()),
             RecvTimeoutError::Disconnected => {
                 Error::Unrecoverable("Packet receiver thread is disconnected!".to_string())
             }
-        })
+        })?;
+        self.clock_instant = inst;
+        self.clock_time = time;
+        Ok((msg, addr))
     }
     fn start(&mut self) -> Result<(), Error> {
         self.configure(ConfigMessage::Start)?;

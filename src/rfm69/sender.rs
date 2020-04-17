@@ -44,10 +44,11 @@ impl Rfm69PS {
 
 impl PacketSender for Rfm69PS {
     fn send_packet(&mut self, msg: &[u8], start_time: u32) -> Result<(), Error> {
-        assert!(msg.len() <= 234);
-        let msglen = msg.len() + 16 + 4; // msg + ecc + time
+        assert!(msg.len() <= 233);
+        let msglen = msg.len() + 16 + 4 + 1; // msg + ecc + time + zero-address byte
         let mut vec = Vec::with_capacity(msglen + 1); // msglen + len byte
         vec.push(msglen as u8);
+        vec.push(0);
         vec.extend_from_slice(&start_time.to_be_bytes());
         vec.extend_from_slice(msg);
         let encoded = self.encoder.encode(&vec[1..]);

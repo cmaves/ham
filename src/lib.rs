@@ -60,9 +60,12 @@ fn cond_set_bit(byte: u8, bit: u8, cond: bool) -> u8 {
 fn set_bit_to(byte: u8, bit: u8, val: bool) -> u8 {
     cond_set_bit(unset_bit(byte, bit), bit, val)
 }
-
+/// The methods required by a packet receiver.
+///
+///
 pub trait PacketReceiver {
-    fn cur_time(&self) -> Result<u32, Error>;
+    fn cur_time(&self) -> u32;
+    fn last_time(&self) -> u32;
     fn recv_packet(&mut self) -> Result<(Vec<u8>, Address), Error>;
     fn recv_packet_timeout(&mut self, timeout: Duration) -> Result<(Vec<u8>, Address), Error>;
     fn start(&mut self) -> Result<(), Error>;

@@ -1,7 +1,7 @@
 use gpio_cdev::Chip;
 use ham::rfm69::{DioMapping, Mode, PacketConfig, Rfm69, SyncConfig};
-use ham::{Error, PacketReceiver, PacketSender};
 use ham::{IntoPacketReceiver, IntoPacketSender};
+use ham::{PacketReceiver, PacketSender};
 use rand::prelude::*;
 use spidev::Spidev;
 use std::thread::{sleep, spawn};
@@ -140,6 +140,7 @@ fn send_recv_variable_with_dio() {
     rfm1.set_dios(&rfm1_dios);
     rfm2.set_dios(&rfm2_dios);
     let dm = DioMapping::default().set_map(1, 0x02);
+    rfm1.set_dio_mapping(dm).unwrap();
     send_recv_variable(rfm1, rfm2);
 }
 
@@ -246,7 +247,7 @@ fn packetreceiver_sender() {
     let mut msg = [0; 234];
     let mut cpy = [0; 234];
     let mut rng = thread_rng();
-    for i in &[0_usize, 1, 8, 16, 32, 64, 128, 234] {
+    for i in &[0_usize, 1, 8, 16, 32, 64, 128, 233] {
         let i = *i;
         rng.try_fill(&mut msg[..i]).unwrap();
         cpy[..i].copy_from_slice(&msg[..i]);
@@ -258,7 +259,9 @@ fn packetreceiver_sender() {
             match receiver.recv_packet_timeout(Duration::from_secs(5)) {
                 Ok((recvd, _)) => {
                     assert_eq!(recvd[..i], cpy[..i]);
-                    let cur_time = receiver.cur_time().unwrap();
+                    let last_time = receiver.last_time();
+                    let cur_time = receiver.cur_time();
+                    assert_eq!(last_time, time);
                     assert!(cur_time.wrapping_sub(time) <= 5_000_000);
                     receiver
                         .terminate()
