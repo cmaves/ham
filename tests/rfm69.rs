@@ -256,8 +256,8 @@ fn packetreceiver_sender() {
         receiver.start().unwrap();
         let recv = spawn(move || {
             eprintln!("Waiting up to 5 seconds for reception....");
-            match receiver.recv_packet_timeout(Duration::from_secs(5)) {
-                Ok((recvd, _)) => {
+            match receiver.recv_pkt_to(Duration::from_secs(5)) {
+                Ok(recvd) => {
                     assert_eq!(recvd[..i], cpy[..i]);
                     let last_time = receiver.last_time();
                     let cur_time = receiver.cur_time();

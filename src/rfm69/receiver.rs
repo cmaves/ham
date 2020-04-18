@@ -1,5 +1,5 @@
 use crate::rfm69::{DCFree, Filtering, Mode, PacketConfig, Rfm69, SyncConfig};
-use crate::{Address, IntoPacketReceiver};
+use crate::IntoPacketReceiver;
 use crate::{
     AddressPacketReceiver, BroadcastPacketReceiver, NetworkPacketReceiver, PacketReceiver,
 };
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 pub struct Rfm69PR {
     rfm_thread: JoinHandle<Result<Rfm69, (Error, Rfm69)>>,
     conf_sender: SyncSender<ConfigMessage<[u8; 4], u8>>,
-    msg_recv: Receiver<(Vec<u8>, Address, Instant, u32)>,
+    msg_recv: Receiver<(Vec<u8>, u8, Instant, u32)>,
     clock_instant: Instant,
     clock_time: u32,
     started: bool,
@@ -175,16 +175,7 @@ impl IntoPacketReceiver for Rfm69 {
 								let time = u32::from_be_bytes(time);
 								let mut vec = Vec::new();
 								vec.extend_from_slice(&buf[5..]);
-								let t = match self.pc.filtering() {
-									Filtering::None => {
-										Address::None
-									},
-									Filtering::Address|Filtering::Both => {
-										if buf[0] == self.pc.address() { Address::Address } else { Address::Broadcast }
-									},
-									_ => unreachable!()
-								};
-								if let Err(_) = msg_sender.send((vec, t, start, time)) {
+								if let Err(_) = msg_sender.send((vec, buf[0], start, time)) {
 									return Err((Error::Unrecoverable("Reader thread: Receiver Message is disconnected".to_string()), self));
 								}
 							} else {
@@ -219,18 +210,18 @@ impl PacketReceiver for Rfm69PR {
     fn last_time(&self) -> u32 {
         self.clock_time
     }
-    fn recv_packet(&mut self) -> Result<(Vec<u8>, Address), Error> {
+    fn recv_pkt(&mut self) -> Result<Vec<u8>, Error> {
         assert!(self.started);
-        let (msg, addr, inst, time) = self.msg_recv.recv().map_err(|_| {
+        let (msg, _, inst, time) = self.msg_recv.recv().map_err(|_| {
             Error::Unrecoverable("Packet receiver thread is disconnected!".to_string())
         })?;
         self.clock_instant = inst;
         self.clock_time = time;
-        Ok((msg, addr))
+        Ok(msg)
     }
-    fn recv_packet_timeout(&mut self, timeout: Duration) -> Result<(Vec<u8>, Address), Error> {
+    fn recv_pkt_to(&mut self, timeout: Duration) -> Result<Vec<u8>, Error> {
         assert!(self.started);
-        let (msg, addr, inst, time) = self.msg_recv.recv_timeout(timeout).map_err(|e| match e {
+        let (msg, _, inst, time) = self.msg_recv.recv_timeout(timeout).map_err(|e| match e {
             RecvTimeoutError::Timeout => Error::Timeout("Packet reception timed out.".to_string()),
             RecvTimeoutError::Disconnected => {
                 Error::Unrecoverable("Packet receiver thread is disconnected!".to_string())
@@ -238,7 +229,7 @@ impl PacketReceiver for Rfm69PR {
         })?;
         self.clock_instant = inst;
         self.clock_time = time;
-        Ok((msg, addr))
+        Ok(msg)
     }
     fn start(&mut self) -> Result<(), Error> {
         self.configure(ConfigMessage::Start)?;
@@ -260,6 +251,27 @@ impl NetworkPacketReceiver<&[u8]> for Rfm69PR {
     }
 }
 impl AddressPacketReceiver<&[u8], u8> for Rfm69PR {
+    fn recv_pkt_addr(&mut self) -> Result<(Vec<u8>, u8), Error> {
+        assert!(self.started);
+        let (msg, addr, inst, time) = self.msg_recv.recv().map_err(|_| {
+            Error::Unrecoverable("Packet receiver thread is disconnected!".to_string())
+        })?;
+        self.clock_instant = inst;
+        self.clock_time = time;
+        Ok((msg, addr))
+    }
+    fn recv_pkt_to_addr(&mut self, timeout: Duration) -> Result<(Vec<u8>, u8), Error> {
+        assert!(self.started);
+        let (msg, addr, inst, time) = self.msg_recv.recv_timeout(timeout).map_err(|e| match e {
+            RecvTimeoutError::Timeout => Error::Timeout("Packet reception timed out.".to_string()),
+            RecvTimeoutError::Disconnected => {
+                Error::Unrecoverable("Packet receiver thread is disconnected!".to_string())
+            }
+        })?;
+        self.clock_instant = inst;
+        self.clock_time = time;
+        Ok((msg, addr))
+    }
     #[inline]
     fn set_addr(&mut self, addr: u8) -> Result<(), Error> {
         self.configure(ConfigMessage::SetAddr(addr))

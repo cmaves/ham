@@ -4,6 +4,10 @@ use spidev::{SpiModeFlags, Spidev, SpidevOptions, SpidevTransfer};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+enum Test {
+    V1(u8),
+    V2(u8),
+}
 fn main() {
     let mut sc = SyncConfig::default();
     let chip = Chip::new("/dev/gpiochip0").unwrap();

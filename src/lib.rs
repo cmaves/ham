@@ -66,8 +66,8 @@ fn set_bit_to(byte: u8, bit: u8, val: bool) -> u8 {
 pub trait PacketReceiver {
     fn cur_time(&self) -> u32;
     fn last_time(&self) -> u32;
-    fn recv_packet(&mut self) -> Result<(Vec<u8>, Address), Error>;
-    fn recv_packet_timeout(&mut self, timeout: Duration) -> Result<(Vec<u8>, Address), Error>;
+    fn recv_pkt(&mut self) -> Result<Vec<u8>, Error>;
+    fn recv_pkt_to(&mut self, timeout: Duration) -> Result<Vec<u8>, Error>;
     fn start(&mut self) -> Result<(), Error>;
     fn pause(&mut self) -> Result<(), Error>;
 }
@@ -87,6 +87,8 @@ trait NetworkPacketReceiver<N>: PacketReceiver {
     fn set_network(&mut self, netaddr: N) -> Result<(), Error>;
 }
 trait AddressPacketReceiver<N, A>: NetworkPacketReceiver<N> {
+    fn recv_pkt_addr(&mut self) -> Result<(Vec<u8>, u8), Error>;
+    fn recv_pkt_to_addr(&mut self, timeout: Duration) -> Result<(Vec<u8>, u8), Error>;
     fn set_addr(&mut self, addr: A) -> Result<(), Error>;
 }
 trait BroadcastPacketReceiver<N, A>: AddressPacketReceiver<N, A> {
@@ -128,11 +130,6 @@ enum ConfigMessage<N, A> {
     Start,
     Alive, // intended to do nothing, just validate thread is running
     Verbose(bool),
-}
-pub enum Address {
-    None,
-    Address,
-    Broadcast,
 }
 
 pub enum Void {}
