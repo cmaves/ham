@@ -6,7 +6,7 @@ use crate::{NetworkPacketSender, PacketSender};
 use reed_solomon::Encoder;
 use std::sync::mpsc::{channel, Sender};
 use std::thread::{Builder as ThreadBuilder, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct Rfm69PS {
     rfm_thread: JoinHandle<Result<Rfm69, (Error, Rfm69)>>,
@@ -45,6 +45,7 @@ impl Rfm69PS {
 impl PacketSender for Rfm69PS {
     fn send_packet(&mut self, msg: &[u8], start_time: u32) -> Result<(), Error> {
         assert!(msg.len() <= 233);
+        let now = Instant::now();
         let msglen = msg.len() + 16 + 4 + 1; // msg + ecc + time + zero-address byte
         let mut vec = Vec::with_capacity(msglen + 1); // msglen + len byte
         vec.push(msglen as u8);
@@ -53,7 +54,7 @@ impl PacketSender for Rfm69PS {
         vec.extend_from_slice(msg);
         let encoded = self.encoder.encode(&vec[1..]);
         vec.extend_from_slice(encoded.ecc());
-        let vec = ConfigMessage::SendMessage(vec);
+        let vec = ConfigMessage::SendMessage(vec, now);
         self.conf_sender
             .send(vec)
             .map_err(|_| Error::Unrecoverable("Sending thread is disconnected!".to_string()))
@@ -93,7 +94,11 @@ impl IntoPacketSender for Rfm69 {
 			loop {
 				if let Ok(v) = conf_recv.recv() {
 					match v {
-						ConfigMessage::SendMessage(msg) => {
+						ConfigMessage::SendMessage(mut msg, start) => {
+                            let time = ((msg[2] as u32) << 24) + ((msg[3] as u32) << 16) + ((msg[4] as u32) << 8) + msg[5] as u32;
+                            let diff = Instant::now().duration_since(start).as_micros() as u32;
+                            let time = time.wrapping_add(diff).to_be_bytes();
+                            msg[2..6].copy_from_slice(&time);
 							if let Err(e) = self.send(&msg) {
 								return Err((Error::Unrecoverable(format!("Receive error: error occured when sending message!: {:?}", e)), self))
 							}

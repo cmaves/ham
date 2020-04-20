@@ -1,5 +1,5 @@
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "hp-sleep")]
 use spin_sleep;
@@ -124,7 +124,7 @@ enum ConfigMessage<N, A> {
     SetNetwork(N),
     SetAddr(A),
     SetBroadcast(A),
-    SendMessage(Vec<u8>),
+    SendMessage(Vec<u8>, Instant),
     Terminate,
     Pause,
     Start,
