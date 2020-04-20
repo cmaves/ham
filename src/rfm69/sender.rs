@@ -44,7 +44,7 @@ impl Rfm69PS {
 
 impl PacketSender for Rfm69PS {
     fn send_packet(&mut self, msg: &[u8], start_time: u32) -> Result<(), Error> {
-        assert!(msg.len() <= 233);
+        assert!(msg.len() <= self.mtu());
         let now = Instant::now();
         let msglen = msg.len() + 16 + 4 + 1; // msg + ecc + time + zero-address byte
         let mut vec = Vec::with_capacity(msglen + 1); // msglen + len byte
@@ -58,6 +58,10 @@ impl PacketSender for Rfm69PS {
         self.conf_sender
             .send(vec)
             .map_err(|_| Error::Unrecoverable("Sending thread is disconnected!".to_string()))
+    }
+    #[inline]
+    fn mtu(&self) -> usize {
+        233
     }
 }
 

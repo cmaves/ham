@@ -70,6 +70,7 @@ pub trait PacketReceiver {
     fn recv_pkt_to(&mut self, timeout: Duration) -> Result<Vec<u8>, Error>;
     fn start(&mut self) -> Result<(), Error>;
     fn pause(&mut self) -> Result<(), Error>;
+    fn mtu(&self) -> usize;
 }
 pub trait IntoPacketReceiver {
     type Recv: PacketReceiver;
@@ -99,6 +100,7 @@ trait VerifiedPacketReceiver: PacketReceiver {
 }
 pub trait PacketSender {
     fn send_packet(&mut self, msg: &[u8], start_time: u32) -> Result<(), Error>;
+    fn mtu(&self) -> usize;
 }
 pub trait IntoPacketSender {
     type Send: PacketSender;

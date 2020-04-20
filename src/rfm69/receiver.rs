@@ -241,6 +241,10 @@ impl PacketReceiver for Rfm69PR {
         self.started = false;
         Ok(())
     }
+    #[inline]
+    fn mtu(&self) -> usize {
+        233
+    }
 }
 impl NetworkPacketReceiver<&[u8]> for Rfm69PR {
     fn set_network(&mut self, netaddr: &[u8]) -> Result<(), Error> {
