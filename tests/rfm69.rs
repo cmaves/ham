@@ -4,6 +4,7 @@ use ham::{IntoPacketReceiver, IntoPacketSender};
 use ham::{PacketReceiver, PacketSender};
 use rand::prelude::*;
 use spidev::Spidev;
+use std::cmp::Ordering;
 use std::thread::{sleep, spawn};
 use std::time::Duration;
 
@@ -303,5 +304,44 @@ fn packetreceiver_sender() {
                 panic!("Test receiving thread panicked!")
             }
         }
+    }
+}
+#[test]
+fn try_iter() {
+    let (rfm1, mut rfm2) = get_pair();
+    let bitrate = rfm1.bitrate();
+    // rfm2.set_preamble_len(100).unwrap();
+    let mut receiver = rfm1.into_packet_receiver().unwrap();
+    receiver.set_verbose(true).unwrap();
+    let mut sender = rfm2.into_packet_sender().unwrap();
+    let mut msgs = [[0_u8; 8]; 8];
+    let mut rng = thread_rng();
+    receiver.start().unwrap();
+    sleep(Duration::from_millis(200)); // let settle
+    for msg in msgs.iter_mut() {
+        rng.try_fill(msg).unwrap();
+        sender.send_packet(msg, 0).unwrap();
+    }
+    sleep(Duration::from_secs_f64(
+        (msgs[0].len() as f64 + 8.0 + 2.0 + 2.0 + 21.0) * 8.0 * msgs.len() as f64 / bitrate as f64
+            + 0.1,
+    ));
+    let r_iter = receiver.try_iter();
+    if !r_iter.eq(msgs.iter()) {
+        let rfm1 = receiver.terminate().ok().unwrap();
+        let mut receiver = rfm1.into_packet_receiver().unwrap();
+        receiver.set_verbose(true).unwrap();
+        receiver.start().unwrap();
+        sleep(Duration::from_millis(200)); // let settle
+        for msg in msgs.iter() {
+            sender.send_packet(msg, 0).unwrap();
+        }
+        sleep(Duration::from_secs_f64(
+            (msgs[0].len() as f64 + 8.0 + 2.0 + 2.0 + 21.0) * 8.0 * msgs.len() as f64
+                / bitrate as f64
+                + 0.1,
+        ));
+        let r_iter = receiver.try_iter();
+        assert!(r_iter.eq(msgs.iter()));
     }
 }

@@ -68,9 +68,29 @@ pub trait PacketReceiver {
     fn last_time(&self) -> u32;
     fn recv_pkt(&mut self) -> Result<Vec<u8>, Error>;
     fn recv_pkt_to(&mut self, timeout: Duration) -> Result<Vec<u8>, Error>;
+    #[inline]
+    fn try_recv_pkt(&mut self) -> Result<Vec<u8>, Error> {
+        self.recv_pkt_to(Duration::from_secs(0))
+    }
     fn start(&mut self) -> Result<(), Error>;
     fn pause(&mut self) -> Result<(), Error>;
     fn mtu(&self) -> usize;
+    fn try_iter(&mut self) -> TryIter<'_, Self>
+    where
+        Self: Sized,
+    {
+        TryIter { recv: self }
+    }
+}
+
+pub struct TryIter<'a, T: PacketReceiver> {
+    recv: &'a mut T,
+}
+impl<T: PacketReceiver> Iterator for TryIter<'_, T> {
+    type Item = Vec<u8>;
+    fn next(&mut self) -> Option<Vec<u8>> {
+        self.recv.try_recv_pkt().ok()
+    }
 }
 pub trait IntoPacketReceiver {
     type Recv: PacketReceiver;

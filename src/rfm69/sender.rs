@@ -1,4 +1,5 @@
 use crate::rfm69::{DCFree, Mode, PacketConfig, Rfm69, SyncConfig};
+use crate::sleep;
 use crate::IntoPacketSender;
 use crate::{ConfigMessage, Error};
 use crate::{NetworkPacketSender, PacketSender};
@@ -95,6 +96,7 @@ impl IntoPacketSender for Rfm69 {
 			if let Err(e) = init_dev() {
 				return Err((Error::Init(format!("Reader configuration failed: {:?}", e)), self));
 			}
+            let mut last_msg_settle = Instant::now();
 			loop {
 				if let Ok(v) = conf_recv.recv() {
 					match v {
@@ -103,9 +105,11 @@ impl IntoPacketSender for Rfm69 {
                             let diff = Instant::now().duration_since(start).as_micros() as u32;
                             let time = time.wrapping_add(diff).to_be_bytes();
                             msg[2..6].copy_from_slice(&time);
+                            sleep(last_msg_settle.saturating_duration_since(Instant::now()));
 							if let Err(e) = self.send(&msg) {
 								return Err((Error::Unrecoverable(format!("Receive error: error occured when sending message!: {:?}", e)), self))
 							}
+                            last_msg_settle =  Instant::now() + Duration::from_secs_f64(1.0 * 8.0 / self.bitrate() as f64);
 						},
 						ConfigMessage::Terminate => return Ok(self),
 						ConfigMessage::Alive => (),
