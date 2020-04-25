@@ -5,13 +5,13 @@ use crate::{ConfigMessage, Error};
 use crate::{NetworkPacketSender, PacketSender};
 
 use reed_solomon::Encoder;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::{Builder as ThreadBuilder, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub struct Rfm69PS {
     rfm_thread: JoinHandle<Result<Rfm69, (Error, Rfm69)>>,
-    conf_sender: Sender<ConfigMessage<[u8; 4], u8>>,
+    conf_sender: SyncSender<ConfigMessage<[u8; 4], u8>>,
     encoder: Encoder,
     verbose: bool,
 }
@@ -77,9 +77,9 @@ impl NetworkPacketSender<&[u8]> for Rfm69PS {
 
 impl IntoPacketSender for Rfm69 {
     type Send = Rfm69PS;
-    fn into_packet_sender(mut self) -> Result<Self::Send, Error> {
+    fn into_packet_sender(mut self, msg_buf: usize) -> Result<Self::Send, Error> {
         self.set_mode_internal(Mode::Standby)?;
-        let (conf_sender, conf_recv) = channel();
+        let (conf_sender, conf_recv) = sync_channel(msg_buf);
         let encoder = Encoder::new(16);
         let builder = ThreadBuilder::new().name("rfm69_sender".to_string());
         let mut _verbose = false;

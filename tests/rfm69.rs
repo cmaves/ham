@@ -242,7 +242,7 @@ fn packetreceiver_sender() {
     let (rfm1, rfm2) = get_pair();
     let bitrate = rfm1.bitrate();
     let mut receiver = rfm1.into_packet_receiver().unwrap();
-    let mut sender = rfm2.into_packet_sender().unwrap();
+    let mut sender = rfm2.into_packet_sender(2).unwrap();
     sender.set_verbose(true).unwrap();
 
     let mut msg = [0; 234];
@@ -279,9 +279,6 @@ fn packetreceiver_sender() {
         sleep(Duration::from_secs(1));
         let mut send = || {
             sender.send_packet(&msg[..i], time)?;
-            sleep(Duration::from_secs_f64(
-                (i as f64 + 8.0 + 2.0 + 2.0 + 21.0) * 8.0 / bitrate as f64,
-            ));
             sender.send_packet(&msg[..i], time)
         };
         if let Err(_) = send() {
@@ -313,7 +310,7 @@ fn try_iter() {
     // rfm2.set_preamble_len(100).unwrap();
     let mut receiver = rfm1.into_packet_receiver().unwrap();
     receiver.set_verbose(true).unwrap();
-    let mut sender = rfm2.into_packet_sender().unwrap();
+    let mut sender = rfm2.into_packet_sender(8).unwrap();
     let mut msgs = [[0_u8; 8]; 8];
     let mut rng = thread_rng();
     receiver.start().unwrap();

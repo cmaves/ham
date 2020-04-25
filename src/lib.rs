@@ -124,7 +124,7 @@ pub trait PacketSender {
 }
 pub trait IntoPacketSender {
     type Send: PacketSender;
-    fn into_packet_sender(self) -> Result<Self::Send, Error>;
+    fn into_packet_sender(self, msg_buf: usize) -> Result<Self::Send, Error>;
 }
 pub trait NetworkPacketSender<N>: PacketSender {
     fn set_network(&mut self, netaddr: N) -> Result<(), Error>;
@@ -134,12 +134,6 @@ trait AddressPacketSender<N, A>: NetworkPacketSender<N> {
 }
 trait VerifiedPacketSender: PacketSender {
     fn send_v_packet(&self) -> Result<(), Error>;
-}
-impl<T: PacketSender> IntoPacketSender for T {
-    type Send = T;
-    fn into_packet_sender(self) -> Result<Self::Send, Error> {
-        Ok(self)
-    }
 }
 
 enum ConfigMessage<N, A> {
