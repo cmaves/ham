@@ -38,12 +38,15 @@ fn get_some() -> Rfm69 {
     rfm1
 }
 fn get_pair() -> (Rfm69, Rfm69) {
-    let rfm1 = get_some();
+    let mut rfm1 = get_some();
     let mut chip = Chip::new(GPIOCHIP).unwrap();
     let rst = chip.get_line(RFM2_RST).unwrap();
     let en = chip.get_line(RFM2_EN).unwrap();
     let spidev = Spidev::open(RFM2_SPI).unwrap();
-    let rfm2 = Rfm69::new(rst, en, spidev).unwrap();
+    let mut rfm2 = Rfm69::new(rst, en, spidev).unwrap();
+
+    rfm1.set_verbose(true);
+    rfm2.set_verbose(true);
     (rfm1, rfm2)
 }
 #[test]
@@ -167,10 +170,15 @@ fn send_recv_variable(mut rfm1: Rfm69, mut rfm2: Rfm69) {
         cpy[..i].copy_from_slice(&msg[1..i + 1]);
         let recv = spawn(move || {
             let mut recvd = [0; 255];
-            let len = rfm1.recv(&mut recvd[..i], Duration::from_secs(5)).unwrap();
+            let len = rfm1.recv(&mut recvd, Duration::from_secs(5)).unwrap();
+            eprintln!("receiver Rssi: {:?}", rfm1.rssi().unwrap());
             rfm1.set_mode(Mode::Standby).unwrap();
             assert_eq!(len, i);
-            assert_eq!(recvd[..i], cpy[..i]);
+            /*
+            if &cpy[..i] != &recvd[..i] {
+                eprintln!("{:?}\n{:?}", &cpy[..], &recvd[..]);
+            }*/
+            assert_eq!(cpy[..i], recvd[..i]);
             rfm1
         });
         sleep(Duration::from_secs(1));
@@ -243,7 +251,7 @@ fn packetreceiver_sender() {
     let bitrate = rfm1.bitrate();
     let mut receiver = rfm1.into_packet_receiver().unwrap();
     let mut sender = rfm2.into_packet_sender(2).unwrap();
-    sender.set_verbose(true).unwrap();
+    sender.set_verbose(3).unwrap();
 
     let mut msg = [0; 234];
     let mut cpy = [0; 234];
@@ -253,7 +261,7 @@ fn packetreceiver_sender() {
         rng.try_fill(&mut msg[..i]).unwrap();
         cpy[..i].copy_from_slice(&msg[..i]);
         let time = i as u32 * 1_000_000;
-        receiver.set_verbose(true).unwrap();
+        receiver.set_verbose(3).unwrap();
         receiver.start().unwrap();
         let recv = spawn(move || {
             eprintln!("Waiting up to 5 seconds for reception....");
@@ -309,7 +317,7 @@ fn try_iter() {
     let bitrate = rfm1.bitrate();
     // rfm2.set_preamble_len(100).unwrap();
     let mut receiver = rfm1.into_packet_receiver().unwrap();
-    receiver.set_verbose(true).unwrap();
+    receiver.set_verbose(3).unwrap();
     let mut sender = rfm2.into_packet_sender(8).unwrap();
     let mut msgs = [[0_u8; 8]; 8];
     let mut rng = thread_rng();
@@ -327,7 +335,7 @@ fn try_iter() {
     if !r_iter.eq(msgs.iter()) {
         let rfm1 = receiver.terminate().ok().unwrap();
         let mut receiver = rfm1.into_packet_receiver().unwrap();
-        receiver.set_verbose(true).unwrap();
+        receiver.set_verbose(3).unwrap();
         receiver.start().unwrap();
         sleep(Duration::from_millis(200)); // let settle
         for msg in msgs.iter() {

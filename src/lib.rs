@@ -145,7 +145,7 @@ enum ConfigMessage<N, A> {
     Pause,
     Start,
     Alive, // intended to do nothing, just validate thread is running
-    Verbose(bool),
+    Verbose(u8),
 }
 
 pub enum Void {}

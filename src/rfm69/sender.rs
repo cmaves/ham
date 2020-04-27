@@ -13,7 +13,7 @@ pub struct Rfm69PS {
     rfm_thread: JoinHandle<Result<Rfm69, (Error, Rfm69)>>,
     conf_sender: SyncSender<ConfigMessage<[u8; 4], u8>>,
     encoder: Encoder,
-    verbose: bool,
+    verbose: u8,
 }
 impl Rfm69PS {
     pub fn terminate(self) -> Result<Rfm69, (Error, Option<Rfm69>)> {
@@ -36,7 +36,7 @@ impl Rfm69PS {
     pub fn alive(&mut self) -> Result<(), Error> {
         self.configure(ConfigMessage::Alive)
     }
-    pub fn set_verbose(&mut self, verbose: bool) -> Result<(), Error> {
+    pub fn set_verbose(&mut self, verbose: u8) -> Result<(), Error> {
         self.configure(ConfigMessage::Verbose(verbose))?;
         self.verbose = verbose;
         Ok(())
@@ -82,8 +82,8 @@ impl IntoPacketSender for Rfm69 {
         let (conf_sender, conf_recv) = sync_channel(msg_buf);
         let encoder = Encoder::new(16);
         let builder = ThreadBuilder::new().name("rfm69_sender".to_string());
-        let mut _verbose = false;
         let rfm_thread = builder.spawn(move || {
+            let mut verbose = 0;
 			let mut init_dev = ||{
 				let pc = PacketConfig::default().set_variable(true).set_crc(false).set_dc(DCFree::Whitening);
 				self.set_config(pc)?;
@@ -102,10 +102,17 @@ impl IntoPacketSender for Rfm69 {
 					match v {
 						ConfigMessage::SendMessage(mut msg, start) => {
                             let time = ((msg[2] as u32) << 24) + ((msg[3] as u32) << 16) + ((msg[4] as u32) << 8) + msg[5] as u32;
+                            sleep(last_msg_settle.saturating_duration_since(Instant::now()));
                             let diff = Instant::now().duration_since(start).as_micros() as u32;
+                            if verbose >= 3 {
+                                eprintln!("rfm69_sender thread: channel delay {} ms", diff);
+                            }
                             let time = time.wrapping_add(diff).to_be_bytes();
                             msg[2..6].copy_from_slice(&time);
-                            sleep(last_msg_settle.saturating_duration_since(Instant::now()));
+                            #[cfg(debug)]{
+                            if verbose >= 4 {
+                                eprintln!("rfm69_sender thread: sending {:2x?}", msg);
+                            }}
 							if let Err(e) = self.send(&msg) {
 								return Err((Error::Unrecoverable(format!("Receive error: error occured when sending message!: {:?}", e)), self))
 							}
@@ -114,8 +121,8 @@ impl IntoPacketSender for Rfm69 {
 						ConfigMessage::Terminate => return Ok(self),
 						ConfigMessage::Alive => (),
 						ConfigMessage::Verbose(v) => {
-							_verbose = v;
-							self.set_verbose(v)
+							verbose = v;
+							self.set_verbose(v != 0)
 						}
 						_ => unreachable!()
 					}
@@ -129,7 +136,7 @@ impl IntoPacketSender for Rfm69 {
             conf_sender,
             rfm_thread,
             encoder,
-            verbose: false,
+            verbose: 0,
         })
     }
 }

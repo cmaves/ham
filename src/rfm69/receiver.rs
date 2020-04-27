@@ -18,7 +18,7 @@ pub struct Rfm69PR {
     clock_instant: Instant,
     clock_time: u32,
     started: bool,
-    verbose: bool,
+    verbose: u8,
 }
 impl Rfm69PR {
     pub fn terminate(self) -> Result<Rfm69, (Error, Option<Rfm69>)> {
@@ -41,7 +41,7 @@ impl Rfm69PR {
     pub fn alive(&mut self) -> Result<(), Error> {
         self.configure(ConfigMessage::Alive)
     }
-    pub fn set_verbose(&mut self, verbose: bool) -> Result<(), Error> {
+    pub fn set_verbose(&mut self, verbose: u8) -> Result<(), Error> {
         self.configure(ConfigMessage::Verbose(verbose))?;
         self.verbose = verbose;
         Ok(())
@@ -51,7 +51,7 @@ fn message(
     conf_msg: ConfigMessage<[u8; 4], u8>,
     rfm: &mut Rfm69,
     paused: &mut bool,
-    verbose: &mut bool,
+    verbose: &mut u8,
 ) -> Result<bool, Error> {
     match conf_msg {
         ConfigMessage::SetNetwork(netaddr) => {
@@ -82,7 +82,7 @@ fn message(
         }
         ConfigMessage::Verbose(v) => {
             *verbose = v;
-            rfm.set_verbose(v);
+            rfm.set_verbose(v != 0);
             Ok(false)
         }
         ConfigMessage::Start => {
@@ -131,7 +131,7 @@ impl IntoPacketReceiver for Rfm69 {
 				return Err((Error::Init(format!("Reader configuration failed: {:?}", e)), self));
 			}
 			let mut paused = true;
-			let mut verbose = false;
+			let mut verbose = 0;
 			let decoder = Decoder::new(16);
 			loop {
 				// allocate space for the message
@@ -179,7 +179,7 @@ impl IntoPacketReceiver for Rfm69 {
 									return Err((Error::Unrecoverable("Reader thread: Receiver Message is disconnected".to_string()), self));
 								}
 							} else {
-								if verbose { eprintln!("Message received, but bad decode occurred!: {:X?}", data); }
+								if verbose >= 1 { eprintln!("Message received, but bad decode occurred!: {:X?}", data); }
 							}
 						}
 					}
@@ -193,7 +193,7 @@ impl IntoPacketReceiver for Rfm69 {
             clock_instant: Instant::now(),
             clock_time: 0,
             started: false,
-            verbose: false,
+            verbose: 0,
         })
     }
 }

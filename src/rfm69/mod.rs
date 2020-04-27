@@ -1197,7 +1197,7 @@ impl Rfm69 {
     fn send_variable(&self, payload: &[u8]) -> Result<(), Error> {
         if payload.len() > 256 {
             return Err(Error::BadInputs(format!(
-                "Buffer length ({}) cannot be greater than 255!",
+                "Buffer length ({}) cannot be greater than 256!",
                 payload.len()
             )));
         } else if payload.len() < 2 {
@@ -1220,7 +1220,9 @@ impl Rfm69 {
         } else if self.pc.is_variable() && payload.len() - 1 != payload[0] as usize {
             return Err(Error::BadInputs("When using the variable length format, the first byte must be the length of the buffer.".to_string()));
         }
-
+        if self.verbose {
+            eprintln!("send_variable: len {}", payload[0]);
+        }
         self.fifo_write(payload)
     }
     fn send_unlimited(&self, _payload: &[u8]) -> Result<(), Error> {
@@ -1306,7 +1308,7 @@ impl Rfm69 {
         count: u8,
         timeout: Duration,
     ) -> Result<(), Error> {
-        assert!(count <= 66);
+        debug_assert!(count <= 66);
         let irq = self.get_payload_crc()?;
         if let Err(e) = irq.check_and_wait(timeout) {
             if self.sc.on() || self.pc.filtering() != Filtering::None {
