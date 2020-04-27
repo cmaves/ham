@@ -168,6 +168,9 @@ impl IntoPacketReceiver for Rfm69 {
 						let start = now.checked_sub(Duration::from_secs_f64(8.0 * (size as u32 + sync_len + self.preamble_len() as u32 + 1) as f64 / self.bitrate() as f64)).unwrap_or(now);
 						if size >= 16 {
 							let data = &buf[..size];
+                            if verbose >= 3 {
+                                eprintln!("Reader thread: Rssi: {:?}", self.rssi());
+                            }
 							if let Ok(buf) =  decoder.correct(&data, None) {
 								let buf = buf.data();
 								let mut time = [0; 4];

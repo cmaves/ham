@@ -251,7 +251,7 @@ fn packetreceiver_sender() {
     let bitrate = rfm1.bitrate();
     let mut receiver = rfm1.into_packet_receiver().unwrap();
     let mut sender = rfm2.into_packet_sender(2).unwrap();
-    sender.set_verbose(3).unwrap();
+    sender.set_verbose(4).unwrap();
 
     let mut msg = [0; 234];
     let mut cpy = [0; 234];
@@ -335,7 +335,7 @@ fn try_iter() {
     if !r_iter.eq(msgs.iter()) {
         let rfm1 = receiver.terminate().ok().unwrap();
         let mut receiver = rfm1.into_packet_receiver().unwrap();
-        receiver.set_verbose(3).unwrap();
+        receiver.set_verbose(4).unwrap();
         receiver.start().unwrap();
         sleep(Duration::from_millis(200)); // let settle
         for msg in msgs.iter() {
