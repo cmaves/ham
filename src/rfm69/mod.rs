@@ -855,8 +855,22 @@ impl Rfm69 {
         let mut xfers = [addr_xfer, write_xfer];
         self.spi.transfer_multiple(&mut xfers)
     }
-    pub fn rssi(&self) -> Result<f32, std::io::Error> {
-        Ok(self.read(Register::RssiValue)? as f32 / -2.0)
+    pub fn rssi(&self) -> Result<f32, Error> {
+        let mut buf = [0; 2];
+        self.read_many(Register::RssiConfig, &mut buf)?;
+        if (buf[0] & 0x02) == 0x02 {
+            //check if an Rssi measurement is in progress
+            Ok(buf[1] as f32 / -2.0)
+        } else {
+            // RssiValue read is in progress which takes 2 bit cycles. Will wait 4 cycles for a buffer
+            sleep(Duration::from_secs_f64(4.0 / self.bitrate as f64));
+            self.read_many(Register::RssiConfig, &mut buf)?;
+            if (buf[0] & 0x02) == 0x02 {
+                Ok(buf[1] as f32 / -2.0)
+            } else {
+                Err(Error::Timeout("Rssi read timed out!".to_string()))
+            }
+        }
     }
     pub fn read_all(&self) -> Result<[u8; 0x4E], std::io::Error> {
         let mut ret = [0; 0x4E];
