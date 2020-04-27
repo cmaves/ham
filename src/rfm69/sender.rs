@@ -109,10 +109,9 @@ impl IntoPacketSender for Rfm69 {
                             }
                             let time = time.wrapping_add(diff).to_be_bytes();
                             msg[2..6].copy_from_slice(&time);
-                            #[cfg(debug)]{
-                            if verbose >= 4 {
+                            if cfg!(debug_assertion) && verbose >= 4 {
                                 eprintln!("rfm69_sender thread: sending {:2x?}", msg);
-                            }}
+                            }
 							if let Err(e) = self.send(&msg) {
 								return Err((Error::Unrecoverable(format!("Receive error: error occured when sending message!: {:?}", e)), self))
 							}
