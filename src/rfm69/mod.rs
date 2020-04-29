@@ -1274,13 +1274,14 @@ impl Rfm69 {
             Duration::from_secs_f64((273.0 + self.preamble as f64) * 8.0 / self.bitrate as f64);
         self.get_packet_sent()?.check_and_wait(send_timeout)
     }
-    fn fifo_read(&self, buf: &mut [u8], count: u8, timeout: Duration) -> Result<(), Error> {
+    fn fifo_read(&self, buf: &mut [u8], count: u8) -> Result<(), Error> {
         let count = count as usize;
         // wait for the byte to be received
         let fifo = self.get_fifo_not_empty()?;
-        fifo.check_and_wait(timeout)?;
+        let fifo_wait = Duration::from_secs_f64(24.0 / self.bitrate as f64); // 16 bits to byte (manchester encoding + 1)
 
-        let fifo_wait = Duration::from_secs_f64(160.0 / self.bitrate as f64); // 80.0 comes from 8 bits in and a byte x10
+        fifo.check_and_wait(fifo_wait)?;
+
         for i in 0..(count - 1) {
             if let Err(e) = fifo.check_and_wait(fifo_wait) {
                 if IrqWait::check_flag(&self, Irq::FifoOverrun)? {
@@ -1297,8 +1298,9 @@ impl Rfm69 {
             }
         }
         // at this point either CrcOk or PayloadReady should fire
+        let crc_wait = Duration::from_secs_f64((16.0 * 3.0 + 8.0) / self.bitrate as f64); // 16 bits to byte (manchester encoding + 1)
         let ready = self.get_payload_crc()?;
-        if let Err(_) = ready.check_and_wait(fifo_wait) {
+        if let Err(_) = ready.check_and_wait(crc_wait) {
             /* if the sync word and address didnt match we would have timed-out above so we dont need to check
               sync word interrupt.
             */
@@ -1333,14 +1335,11 @@ impl Rfm69 {
             }
         }
     }
-    fn fifo_read_no_check(
-        &self,
-        buf: &mut [u8],
-        count: u8,
-        timeout: Duration,
-    ) -> Result<(), Error> {
+    fn fifo_read_no_check(&self, buf: &mut [u8], count: u8) -> Result<(), Error> {
         debug_assert!(count <= 66);
         let irq = self.get_payload_crc()?;
+        let timeout =
+            Duration::from_secs_f64(((count as f64 + 2.0) * 16.0 + 8.0) / self.bitrate as f64);
         if let Err(e) = irq.check_and_wait(timeout) {
             if self.sc.on() || self.pc.filtering() != Filtering::None {
                 if !IrqWait::check_flag(&self, Irq::SyncAddressMatch)? {
@@ -1389,6 +1388,8 @@ impl Rfm69 {
     }
     fn recv_fixed(&self, buf: &mut [u8], timeout: Duration) -> Result<usize, Error> {
         let len = self.pc.len();
+        let irq = self.get_fifo_not_empty()?;
+        irq.check_and_wait(timeout)?;
         let ret = if len as usize > buf.len() {
             buf.len()
         } else {
@@ -1399,13 +1400,13 @@ impl Rfm69 {
             if self.verbose {
                 eprintln!("Doing fixed_recv(): short message {} ", len);
             }
-            self.fifo_read_no_check(buf, len, timeout).map(|_| ret)
+            self.fifo_read_no_check(buf, len).map(|_| ret)
         } else {
             // long messages are required to be read continously
             if self.verbose {
                 eprintln!("Doing fixed_recv(): long message {} ", len);
             }
-            self.fifo_read(buf, len, timeout).map(|_| ret)
+            self.fifo_read(buf, len).map(|_| ret)
         }
     }
     fn recv_variable(&self, buf: &mut [u8], timeout: Duration) -> Result<usize, Error> {
@@ -1417,12 +1418,12 @@ impl Rfm69 {
             if self.verbose {
                 eprintln!("Doing recv_variable(): short message {}", len);
             }
-            self.fifo_read_no_check(buf, len, timeout).map(|_| ret)
+            self.fifo_read_no_check(buf, len).map(|_| ret)
         } else {
             if self.verbose {
                 eprintln!("Doing recv_variable(): long message {}", len);
             }
-            self.fifo_read(buf, len, timeout).map(|_| ret)
+            self.fifo_read(buf, len).map(|_| ret)
         }
     }
     pub fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, Error> {
@@ -1974,11 +1975,6 @@ impl fmt::Display for Bw {
             dcc, mant, exp
         )
     }
-}
-pub enum Mantissa {
-    XVI = 0x0,
-    XX = 0x08,
-    XXIV = 0x10,
 }
 impl From<DioMapping> for [u8; 2] {
     #[inline]

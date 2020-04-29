@@ -169,9 +169,7 @@ impl IntoPacketReceiver for Rfm69 {
 							Error::BadMessage(_,_) =>(),
 							_=> return Err((Error::Unrecoverable(format!("Receive thread: unrecoverable error occurred when receiving: {:?}", e)), self))
 						}
-					} else {
-                        last_msg_time = Instant::now();
-                    }
+					}
 					let cfg_msg = conf_recv.try_recv().ok();
 					if let Some(v) = cfg_msg {
 						match message(v, &mut self, &mut paused, &mut verbose) {
@@ -180,6 +178,7 @@ impl IntoPacketReceiver for Rfm69 {
 						}
 					} else {
 						let size = if let Ok(size) = res { size } else { continue; };
+                        last_msg_time = Instant::now();
 						let sc = self.sync();
 						let sync_len = (sc.on() as u8 * sc.len()) as u32;
 						let start = now.checked_sub(Duration::from_secs_f64(8.0 * (size as u32 + sync_len + self.preamble_len() as u32 + 1) as f64 / self.bitrate() as f64)).unwrap_or(now);
