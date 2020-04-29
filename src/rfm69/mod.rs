@@ -18,6 +18,9 @@ pub use crate::rfm69::receiver::*;
 mod sender;
 pub use crate::rfm69::sender::*;
 
+#[cfg(test)]
+mod tests;
+
 pub struct Rfm69 {
     rst: LineHandle,
     en: LineHandle,
@@ -284,6 +287,19 @@ impl Rfm69 {
             Err(Error::BadInputs("Bitrate out of bounds!".to_string()))
         } else if let Ok(v) = ((FXOSC as f64 / bitrate as f64).round() as u64).try_into() {
             let v: u16 = v;
+
+            /* The RxBw must be at least half the bitrate.
+              The recommened value for RxBw 10.4kHz while the recommend bitrate is 4.8kbps.
+              Because the recommended value of RxBw is double the bitrate, I'm going to assume
+              it is optimal to maintain this ratio if possible (until we reach higher bitrates).
+            */
+            let mut bws = [0; 2];
+            self.read_many(Register::RxBw, &mut bws)?;
+            let mut bws = [Bw(bws[0]), Bw(bws[1])];
+            bws[0] = bws[0].set_bw_fsk((4800.max(bitrate) * 2).min(500_000));
+            // Same as above but for AfcBw with a ratio of 20 instead of 2, once again based on recommened values.
+            bws[1] = bws[1].set_bw_fsk((4800.max(bitrate) * 20).min(500_000));
+            self.write_many(Register::RxBw, &[bws[0].0, bws[1].0])?;
             self.write_many(Register::BitrateMsb, &v.to_be_bytes())?;
             self.bitrate = bitrate;
             Ok(())
@@ -738,6 +754,7 @@ impl Rfm69 {
     pub fn configure_defaults(&mut self) -> Result<(), Error> {
         self.set_config(PacketConfig::default())?;
         self.set_sync(&SyncConfig::default())?;
+        self.write_many(Register::RxBw, &[Bw::RXBW.0, Bw::AFCBW.0])?;
         self.set_dio_mapping(DioMapping::default())
     }
     /// Resets the RFM69 chip using the RST pin, and then performs simple validations on the chip.
@@ -1432,6 +1449,21 @@ impl Rfm69 {
         self.mode = mode;
         Ok(())
     }
+    pub fn set_rxbw(&self, bw: Bw) -> Result<(), Error> {
+        self.write(Register::RxBw, bw.0)?;
+        Ok(())
+    }
+    pub fn rxbw(&self) -> Result<Bw, Error> {
+        Ok(Bw(self.read(Register::RxBw)?))
+    }
+    pub fn set_afcbw(&self, bw: Bw) -> Result<(), Error> {
+        self.write(Register::AfcBw, bw.0)?;
+        Ok(())
+    }
+    pub fn afcbw(&self) -> Result<Bw, Error> {
+        Ok(Bw(self.read(Register::AfcBw)?))
+    }
+
     /// Sets if the controller should write debug information to `stderr`.
     ///
     /// By default `verbose` is false. This function has no affect on the actual operation of the RFm69 chip.
@@ -1887,6 +1919,67 @@ impl DioMapping {
     }
 }
 
+#[derive(PartialEq, Debug, Clone, Copy)]
+pub struct Bw(u8);
+
+impl Bw {
+    pub fn set_bw_fsk(self, rxbw: u32) -> Self {
+        assert!(2600 <= rxbw && rxbw <= 500_000);
+        let q = FXOSC as f32 / rxbw as f32;
+        let exp = (q / 16.0).log2().trunc();
+        let v = q / exp.exp2();
+        let mant = if 24.0 <= v {
+            2 << 3
+        } else if 20.0 <= v {
+            1 << 3
+        } else {
+            0 << 3
+        };
+        Bw((self.0 & 0xE0) | (exp as u8 - 2) | mant)
+    }
+    #[inline]
+    pub fn set_bw_ook(self, rxbw: u32) -> Self {
+        self.set_bw_fsk(rxbw * 2)
+    }
+    pub fn bw_fsk(self) -> u32 {
+        let exp = 2.0 + (self.0 & 0x7) as f32;
+        let mant = match (self.0 >> 3) & 0x3 {
+            0 => 16.0,
+            1 => 20.0,
+            2 => 24.0,
+            _ => unreachable!(),
+        };
+        (FXOSC as f32 / (exp.exp2() * mant)) as u32
+    }
+    pub fn bw_ook(self) -> u32 {
+        self.bw_fsk() / 2
+    }
+    pub const RXBW: Self = Bw(0x55);
+    pub const AFCBW: Self = Bw(0x8B);
+}
+impl fmt::Display for Bw {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let dcc = self.0 >> 5;
+        let mant = match (self.0 >> 3) & 0x3 {
+            0 => 16,
+            1 => 20,
+            2 => 24,
+            3 => 28,
+            _ => unreachable!(),
+        };
+        let exp = self.0 & 7;
+        write!(
+            f,
+            "Dcc raw value: {}, Mantissa: {}, Exp: {}",
+            dcc, mant, exp
+        )
+    }
+}
+pub enum Mantissa {
+    XVI = 0x0,
+    XX = 0x08,
+    XXIV = 0x10,
+}
 impl From<DioMapping> for [u8; 2] {
     #[inline]
     fn from(dio_map: DioMapping) -> Self {

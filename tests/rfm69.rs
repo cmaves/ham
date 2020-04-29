@@ -59,9 +59,11 @@ fn make_rfm69() {
 #[test]
 fn test_bitrate() {
     let mut rfm69 = get_some();
-    rfm69.set_bitrate(10_000).unwrap();
-    assert_eq!(rfm69.bitrate(), 10_000);
-    assert_eq!(rfm69.bitrate_dev().unwrap(), 10_000);
+    rfm69.set_bitrate(100_000).unwrap();
+    assert_eq!(rfm69.bitrate(), 100_000);
+    assert_eq!(rfm69.bitrate_dev().unwrap(), 100_000);
+    assert!(rfm69.rxbw().unwrap().bw_fsk() >= 50_000);
+    assert!(rfm69.afcbw().unwrap().bw_fsk() >= 50_000);
 }
 #[test]
 fn test_set_dio_maps() {

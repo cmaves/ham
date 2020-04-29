@@ -132,6 +132,7 @@ impl IntoPacketReceiver for Rfm69 {
 			}
 			let mut paused = true;
 			let mut verbose = 0;
+            let mut last_msg_time = Instant::now();
 			let decoder = Decoder::new(16);
 			loop {
 				// allocate space for the message
@@ -146,15 +147,31 @@ impl IntoPacketReceiver for Rfm69 {
 					}
 				} else {
 					let mut buf = [0; 255];
-					let res = self.recv(&mut buf, Duration::from_millis(1000));
+					let res = self.recv(&mut buf, Duration::from_millis(100));
 					let now = Instant::now();
 					if let Err(e) = &res {
 						// handle error on 
 						match e {
-							Error::BadMessage(_,_)|Error::Timeout(_) =>(),
+                            Error::Timeout(_) => if Instant::now().duration_since(last_msg_time) > Duration::from_secs(5) {
+                                /* If there is a large enough drop in Rssi during the reception of the preamble then
+                                   the receviver may need to to be cycled out of Rx mode to receive again.
+                                   I believe this is because the automatic gain control (AGC) is set at the beginning of receiving 
+                                   the preamble and will not be reset until after is received and Rx is restarted.
+                                 */
+                                if let Err(e) = self.set_mode_internal(Mode::FS) {
+                                    return Err((Error::Unrecoverable(format!("Receive thread: unrecoverable error occurred when receiving: {:?}", e)), self));
+                                }
+                                if let Err(e) = self.set_mode_internal(Mode::Rx) {
+                                    return Err((Error::Unrecoverable(format!("Receive thread: unrecoverable error occurred when receiving: {:?}", e)), self));
+                                }
+
+                            },
+							Error::BadMessage(_,_) =>(),
 							_=> return Err((Error::Unrecoverable(format!("Receive thread: unrecoverable error occurred when receiving: {:?}", e)), self))
 						}
-					}
+					} else {
+                        last_msg_time = Instant::now();
+                    }
 					let cfg_msg = conf_recv.try_recv().ok();
 					if let Some(v) = cfg_msg {
 						match message(v, &mut self, &mut paused, &mut verbose) {
