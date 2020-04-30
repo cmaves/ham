@@ -127,7 +127,7 @@ const MAX_FREQ: u32 = 1020_000_000;
 impl Rfm69 {
     //const RECV_FINISH: f64 = 0.000244140625; // 2^-12 secs
     //const RECV_FINISH: f64 = 1.0 / 4096.0; // 2^-12 secs
-    const RECV_FINISH: f64 = 1.0 / 1024.0; // 2^-12 secs
+    const RECV_FINISH: f64 = 1.0 / 64.0; // 2^-12 secs
     fn byte_time(&self) -> Duration {
         Duration::from_secs_f64(
             8.0 * ((self.pc.dc() == DCFree::Manchester) as u8 + 1) as f64 / self.bitrate() as f64,
@@ -1285,7 +1285,8 @@ impl Rfm69 {
             // fixed length
             self.send_fixed(payload)
         }?;
-        let send_timeout = self.byte_time() * (66 + self.byte_overhead() + 1);
+        let send_timeout = self.byte_time() * (66 + self.byte_overhead() + 1)
+            + Duration::from_secs_f64(Self::RECV_FINISH);
         self.get_packet_sent()?.check_and_wait(send_timeout)
     }
     fn fifo_read(&self, buf: &mut [u8], count: u8) -> Result<(), Error> {

@@ -82,57 +82,84 @@ impl IntoPacketSender for Rfm69 {
         let (conf_sender, conf_recv) = sync_channel(msg_buf);
         let encoder = Encoder::new(16);
         let builder = ThreadBuilder::new().name("rfm69_sender".to_string());
-        let rfm_thread = builder.spawn(move || {
-            let mut verbose = 0;
-			let mut init_dev = ||{
-				let pc = PacketConfig::default().set_variable(true).set_crc(false).set_dc(DCFree::Whitening);
-				self.set_config(pc)?;
-				let sc = *SyncConfig::default().set_sync_word(&[0x56, 0xa9, 0x0b, 0x9a]).set_len(4);
-				self.set_sync(sc)?;
-				self.get_mode_ready()?.check_and_wait(Duration::from_millis(10))?;
-				self.set_mode(Mode::Tx)
-			};
-			// configure Rfm69 device for receiving and catch error
-			if let Err(e) = init_dev() {
-				return Err((Error::Init(format!("Reader configuration failed: {:?}", e)), self));
-			}
-            let mut last_msg_settle = Instant::now();
-			loop {
-				if let Ok(v) = conf_recv.recv() {
-					match v {
-						ConfigMessage::SendMessage(mut msg, start) => {
-                            let time = ((msg[2] as u32) << 24) + ((msg[3] as u32) << 16) + ((msg[4] as u32) << 8) + msg[5] as u32;
-                            sleep(last_msg_settle.saturating_duration_since(Instant::now()));
-                            let diff = Instant::now().duration_since(start).as_micros() as u32;
-                            if verbose >= 3 {
-                                eprintln!("rfm69_sender thread: channel delay {} ms", diff);
+        let rfm_thread = builder
+            .spawn(move || {
+                let mut verbose = 0;
+                let mut init_dev = || {
+                    let pc = PacketConfig::default()
+                        .set_variable(true)
+                        .set_crc(false)
+                        .set_dc(DCFree::Whitening);
+                    self.set_config(pc)?;
+                    let sc = *SyncConfig::default()
+                        .set_sync_word(&[0x56, 0xa9, 0x0b, 0x9a])
+                        .set_len(4);
+                    self.set_sync(sc)?;
+                    self.get_mode_ready()?
+                        .check_and_wait(Duration::from_millis(10))?;
+                    self.set_mode(Mode::Tx)
+                };
+                // configure Rfm69 device for receiving and catch error
+                if let Err(e) = init_dev() {
+                    return Err((
+                        Error::Init(format!("Reader configuration failed: {:?}", e)),
+                        self,
+                    ));
+                }
+                let mut last_msg_settle = Instant::now();
+                loop {
+                    if let Ok(v) = conf_recv.recv() {
+                        match v {
+                            ConfigMessage::SendMessage(mut msg, start) => {
+                                let time = ((msg[2] as u32) << 24)
+                                    + ((msg[3] as u32) << 16)
+                                    + ((msg[4] as u32) << 8)
+                                    + msg[5] as u32;
+                                sleep(last_msg_settle.saturating_duration_since(Instant::now()));
+                                let diff = Instant::now().duration_since(start).as_micros() as u32;
+                                if verbose >= 3 {
+                                    eprintln!("rfm69_sender thread: channel delay {} ms", diff);
+                                }
+                                let time = time.wrapping_add(diff).to_be_bytes();
+                                msg[2..6].copy_from_slice(&time);
+                                #[cfg(debug_assertions)]
+                                eprintln!("testing debug");
+                                if cfg!(debug_assertions) && verbose >= 4 {
+                                    eprintln!("rfm69_sender thread: sending {:2x?}", msg);
+                                }
+                                if let Err(e) = self.send(&msg) {
+                                    let err = Error::Unrecoverable(format!(
+                                        "Receive error: error occured when sending message!: {:?}",
+                                        e
+                                    ));
+                                    if verbose >= 2 {
+                                        eprintln!("Terminating sender thread: {:?}", err);
+                                    }
+                                    return Err((err, self));
+                                }
+                                last_msg_settle = Instant::now()
+                                    + Duration::from_secs_f64(1.0 * 8.0 / self.bitrate() as f64);
                             }
-                            let time = time.wrapping_add(diff).to_be_bytes();
-                            msg[2..6].copy_from_slice(&time);
-#[cfg(debug_assertions)]
-                            eprintln!("testing debug");
-                            if cfg!(debug_assertions) && verbose >= 4 {
-                                eprintln!("rfm69_sender thread: sending {:2x?}", msg);
+                            ConfigMessage::Terminate => return Ok(self),
+                            ConfigMessage::Alive => (),
+                            ConfigMessage::Verbose(v) => {
+                                verbose = v;
+                                self.set_verbose(v >= 2)
                             }
-							if let Err(e) = self.send(&msg) {
-								return Err((Error::Unrecoverable(format!("Receive error: error occured when sending message!: {:?}", e)), self))
-							}
-                            last_msg_settle =  Instant::now() + Duration::from_secs_f64(1.0 * 8.0 / self.bitrate() as f64);
-						},
-						ConfigMessage::Terminate => return Ok(self),
-						ConfigMessage::Alive => (),
-						ConfigMessage::Verbose(v) => {
-							verbose = v;
-							self.set_verbose(v >= 2)
-						}
-						_ => unreachable!()
-					}
-				} else {
-					return Err((Error::Unrecoverable("Sender thread: Sender message channel is disconnected!".to_string()), self))
-
-				}
-			}
-		}).unwrap();
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        let err = Error::Unrecoverable(
+                            "Sender thread: Message channel is disconnected!".to_string(),
+                        );
+                        if verbose >= 2 {
+                            eprintln!("Terminating sender thread: {:?}", err);
+                        }
+                        return Err((err, self));
+                    }
+                }
+            })
+            .unwrap();
         Ok(Rfm69PS {
             conf_sender,
             rfm_thread,

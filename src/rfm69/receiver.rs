@@ -189,6 +189,9 @@ impl IntoPacketReceiver for Rfm69 {
                             }
 							if let Ok(buf) =  decoder.correct(&data, None) {
 								let buf = buf.data();
+                                if cfg!(debug_assertions) &&  verbose >= 4  && buf != &data[..data.len() - 16] {
+                                    eprintln!("Reed solomon corrected data");
+                                }
 								let mut time = [0; 4];
 								time.copy_from_slice(&buf[1..5]);
 								let time = u32::from_be_bytes(time);
