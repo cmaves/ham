@@ -21,7 +21,6 @@ pub use crate::rfm69::sender::*;
 #[cfg(test)]
 mod tests;
 
-
 pub struct Rfm69 {
     rst: LineHandle,
     en: LineHandle,
@@ -130,7 +129,9 @@ impl Rfm69 {
     //const RECV_FINISH: f64 = 1.0 / 4096.0; // 2^-12 secs
     const RECV_FINISH: f64 = 1.0 / 1024.0; // 2^-12 secs
     fn byte_time(&self) -> Duration {
-        Duration::from_secs_f64(8.0 * ((self.pc.dc() == DCFree::Manchester) as u8 + 1) as f64 / self.bitrate() as f64)
+        Duration::from_secs_f64(
+            8.0 * ((self.pc.dc() == DCFree::Manchester) as u8 + 1) as f64 / self.bitrate() as f64,
+        )
     }
     fn byte_overhead(&self) -> u32 {
         self.sc.len() as u32 + self.preamble as u32 + self.pc.crc() as u32
@@ -1215,15 +1216,15 @@ impl Rfm69 {
 
         // send remaining bytes if there are any
         if sent < buf.len() {
-        let iw = self.get_fifo_full()?;
-        let first_wait = self.byte_time() * (self.byte_overhead() + 66 + 1);
-        iw.check_and_wait(first_wait)?;
-        let fifo_wait = self.byte_time() * 2; //Duration::from_secs_f64(80.0 / self.bitrate as f64); // 80.0 comes from 8 bits in and a byte x10
-        while sent < buf.len() {
-            iw.check_and_wait(fifo_wait)?; // we need to check if the fifo is full
-            self.write(Register::Fifo, buf[sent])?;
-            sent += 1;
-        }
+            let iw = self.get_fifo_full()?;
+            let first_wait = self.byte_time() * (self.byte_overhead() + 66 + 1);
+            iw.check_and_wait(first_wait)?;
+            let fifo_wait = self.byte_time() * 2; //Duration::from_secs_f64(80.0 / self.bitrate as f64); // 80.0 comes from 8 bits in and a byte x10
+            while sent < buf.len() {
+                iw.check_and_wait(fifo_wait)?; // we need to check if the fifo is full
+                self.write(Register::Fifo, buf[sent])?;
+                sent += 1;
+            }
         }
         Ok(())
     }
@@ -1284,7 +1285,7 @@ impl Rfm69 {
             // fixed length
             self.send_fixed(payload)
         }?;
-        let send_timeout = self.byte_time() * (66 +  self.byte_overhead() + 1);
+        let send_timeout = self.byte_time() * (66 + self.byte_overhead() + 1);
         self.get_packet_sent()?.check_and_wait(send_timeout)
     }
     fn fifo_read(&self, buf: &mut [u8], count: u8) -> Result<(), Error> {
@@ -1353,8 +1354,9 @@ impl Rfm69 {
         debug_assert!(count <= 66);
         let irq = self.get_payload_crc()?;
         /*let timeout =
-            Duration::from_secs_f64(((count as f64 + 3.0) * 16.0) / self.bitrate as f64 + Self::RECV_FINISH);*/
-        let timeout = self.byte_time() * (count as u32 + 3) + Duration::from_secs_f64(Self::RECV_FINISH);
+        Duration::from_secs_f64(((count as f64 + 3.0) * 16.0) / self.bitrate as f64 + Self::RECV_FINISH);*/
+        let timeout =
+            self.byte_time() * (count as u32 + 3) + Duration::from_secs_f64(Self::RECV_FINISH);
         if let Err(e) = irq.check_and_wait(timeout) {
             if self.sc.on() || self.pc.filtering() != Filtering::None {
                 if !IrqWait::check_flag(&self, Irq::SyncAddressMatch)? {
