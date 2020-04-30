@@ -82,7 +82,7 @@ fn message(
         }
         ConfigMessage::Verbose(v) => {
             *verbose = v;
-            rfm.set_verbose(v != 0);
+            rfm.set_verbose(v >= 2);
             Ok(false)
         }
         ConfigMessage::Start => {

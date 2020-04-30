@@ -123,7 +123,7 @@ impl IntoPacketSender for Rfm69 {
 						ConfigMessage::Alive => (),
 						ConfigMessage::Verbose(v) => {
 							verbose = v;
-							self.set_verbose(v != 0)
+							self.set_verbose(v >= 2)
 						}
 						_ => unreachable!()
 					}
